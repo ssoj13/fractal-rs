@@ -60,7 +60,8 @@ map: `C:\projects\projects.rust.cg\nv\prs\kernels-divergence.md`).
 
 Done on the branch:
 - `fractal-core::luma::Luma` {Rec709, AcesCg} + slot `P_LUMA` (3); kernels' `luminance` reads it
-  (user: luma is a per-app working-space option, WarpBro ACEScg, OFX Rec. 709).
+  (user: luma is a working-space option; ACEScg for both WarpBro and OFX, the option set where a
+  host's colours are in another space, 2026-10-11).
 - `fractal-env` crate: OFX's EnvironmentMap core (CDFs, mean, SH9, mips, gpu_entries, irradiance,
   specular) + `turn`, `to_map`, `sun_select`, `pack` (fills P_ENV_*); 6 tests pass. Hosts keep
   their own decode and caches. Orientation verified: OFX `env_to_map` = WarpBro's former

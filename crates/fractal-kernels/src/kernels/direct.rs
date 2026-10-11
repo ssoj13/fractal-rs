@@ -1,4 +1,6 @@
-//! Optional deterministic OFX Direct shading. WarpBro's path tracer does not use it.
+//! Optional deterministic Direct shading (OFX's Direct mode, the twin of its CPU and WGSL
+//! `fractal3d::shade`): one primary march, the key light with a soft shadow, five-probe AO and the
+//! sky or HDRI through its harmonics and mips. WarpBro's path tracer does not use it.
 //! Keeping this module behind the `direct` feature excludes its BSDF and eight entry points
 //! from normal device compilation, rather than merely skipping their dispatch.
 
@@ -131,7 +133,7 @@ pub(super) fn trace_direct<const F: u32>(
     let accepted = m.hit() || (unresolved && m.ratio <= 0.5 * global(P_SAMPLE_CONE));
     if !accepted {
         return PathSample {
-            radiance: sky_radiance(ctx, dir),
+            radiance: background(ctx, lut, dir),
             hit: false,
             albedo: [0.0; 3],
             normal: [0.0; 3],
@@ -186,20 +188,16 @@ pub(super) fn trace_direct<const F: u32>(
     let sun = eval_light_disc(&inputs, &frame, view, l, global(P_LIGHT_HALF_ANGLE)).sum();
     let visibility = direct_shadow::<F>(ctx, m.point, n, l, m.eps);
     let ao = direct_ao::<F>(ctx, m.point, n);
-    let specular_dir = dominant_dir(&frame, view, mx_average_alpha(main_alpha(&inputs)));
-    let coat_dir = dominant_dir(&frame, view, mx_average_alpha(coat_alpha(&inputs)));
-    let t = 0.5 + facing[1] / 3.0;
-    let irradiance = mul(
-        add(
-            pv3(ctx, P_SKY_HORIZON),
-            mul(sub(pv3(ctx, P_SKY_ZENITH), pv3(ctx, P_SKY_HORIZON)), t),
-        ),
-        global(P_SKY_INTENSITY) * ao,
-    );
+    let specular_alpha = mx_average_alpha(main_alpha(&inputs));
+    let coat_lobe_alpha = mx_average_alpha(coat_alpha(&inputs));
+    let specular_dir = dominant_dir(&frame, view, specular_alpha);
+    let coat_dir = dominant_dir(&frame, view, coat_lobe_alpha);
+    // The sky light of Direct (OFX's CPU and WGSL `fractal3d::shade`): the HDRI's harmonics and
+    // its mip level matched to each lobe's width, or the gradient's exact convolution.
     let environment = Environment {
-        irradiance,
-        specular_radiance: mul(sky_radiance(ctx, specular_dir), ao),
-        coat_radiance: mul(sky_radiance(ctx, coat_dir), ao),
+        irradiance: mul(sky_irradiance(ctx, lut, facing), ao),
+        specular_radiance: mul(sky_specular(ctx, lut, specular_dir, specular_alpha), ao),
+        coat_radiance: mul(sky_specular(ctx, lut, coat_dir, coat_lobe_alpha), ao),
         transmission_radiance: [0.0; 3],
     };
     let reflected = eval_environment(&inputs, &frame, view, &environment).sum();

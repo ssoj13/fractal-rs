@@ -1427,6 +1427,7 @@ pub mod kernels {
 
     /// environment.rs EnvironmentMap::irradiance: irradiance over pi about the world normal `n` from
     /// the L2 spherical harmonics, times the intensity.
+    #[cfg(feature = "direct")]
     #[inline(always)]
     fn env_irradiance(ctx: Context<'_>, lut: &[[f32; 4]], n: V3) -> V3 {
         let [x, y, z] = env_to_map(ctx, n);
@@ -1466,6 +1467,7 @@ pub mod kernels {
     /// environment.rs EnvironmentMap::specular: the map toward the world direction `d` filtered for a
     /// GGX lobe of `alpha` (the two levels around log2(max(alpha h / pi, 1)) blended), times the
     /// intensity.
+    #[cfg(feature = "direct")]
     #[inline(always)]
     fn env_specular(ctx: Context<'_>, lut: &[[f32; 4]], d: V3, alpha: f32) -> V3 {
         let texels = (alpha * pr(ctx, P_ENV_HEIGHT) / PI).max(1.0);
@@ -1489,6 +1491,7 @@ pub mod kernels {
 
     /// Direct's diffuse and sheen light (fractal3d.rs Sky::irradiance): the HDRI's harmonics or the
     /// gradient's exact convolution.
+    #[cfg(feature = "direct")]
     #[inline(always)]
     fn sky_irradiance(ctx: Context<'_>, lut: &[[f32; 4]], n: V3) -> V3 {
         if env_on(ctx) {
@@ -1506,6 +1509,7 @@ pub mod kernels {
 
     /// Direct's specular and coat light (fractal3d.rs Sky::specular): the HDRI's level for `alpha`
     /// or the gradient at `d`.
+    #[cfg(feature = "direct")]
     #[inline(always)]
     fn sky_specular(ctx: Context<'_>, lut: &[[f32; 4]], d: V3, alpha: f32) -> V3 {
         if env_on(ctx) {
