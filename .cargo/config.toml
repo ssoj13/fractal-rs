@@ -1,0 +1,8 @@
+[net]
+git-fetch-with-cli = true
+
+[env]
+# cuda-oxide drives compiler-internal APIs from the stable toolchain.
+RUSTC_BOOTSTRAP = "1"
+# Kernel PTX and LLVM IR dumps go under target/, not the repository root.
+CUDA_OXIDE_PTX_DIR = { value = "target/oxide-ptx", relative = true }

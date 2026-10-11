@@ -1,0 +1,3 @@
+# cargo-oxide project config. PTX targets Turing (sm_75), the oldest GPU the consumers support;
+# the driver JIT-compiles it for newer GPUs. `--arch` overrides it.
+default-arch = "sm_75"
