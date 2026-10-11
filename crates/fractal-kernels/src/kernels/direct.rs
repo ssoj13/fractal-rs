@@ -123,7 +123,7 @@ pub(super) fn trace_direct<const F: u32>(
     origin: V3,
     dir: V3,
 ) -> PathSample {
-    let m = march::<F>(ctx, origin, dir, RAY_DIRECT, 0.0, global(P_FOOTPRINT));
+    let m = march::<F>(ctx, origin, dir, RAY_DIRECT, 0.0, global(P_FOOTPRINT), 0.0);
     let unresolved = m.outcome == Outcome::Unresolved;
     // Keinert et al. 2014 (Enhanced Sphere Tracing, 3.2): one ray per pixel, so an unresolved
     // ray's closest sample stands in for the surface when its screen-space error is under half

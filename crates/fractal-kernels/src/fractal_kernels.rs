@@ -875,6 +875,9 @@ pub mod kernels {
         object: usize,
         /// `Unresolved`: the closest sample's estimate in footprints (`d / eps`).
         ratio: f32,
+        /// `Hit` on the march's very first sample: the ray started in a hit, the case the leave
+        /// restart retries ([`march_leaving`]).
+        first: bool,
     }
     impl Hit {
         #[inline(always)]
@@ -951,6 +954,42 @@ pub mod kernels {
         Some(((-b - root).max(0.0), t_exit.min(max_distance)))
     }
 
+    /// The ray length below which no camera ray of the pixel with centre ray `dir` can hit: a
+    /// cone march along the centre ray with the pixel cone `0.5 sqrt(w^2 + h^2)` of one pixel on
+    /// the unit image plane, exact for an exact distance. A centre ray that misses the reach ball
+    /// says nothing about the pixel's other rays: 0. Valid for a pinhole camera only (a lens ray
+    /// starts off the cone's apex). OFX's CPU and WGSL twins: `fractal3d::cone_start`,
+    /// `cone_start`.
+    #[inline(always)]
+    fn cone_start<const F: u32>(ctx: Context<'_>, origin: V3, dir: V3) -> f32 {
+        let Some((t_enter, t_exit)) = march_span(ctx, origin, dir) else {
+            return 0.0;
+        };
+        let step_cap = 2.0 * (t_exit - t_enter) / STEP_CAP_STEPS;
+        let slope = pr(ctx, P_FOOTPRINT);
+        let w = 2.0 * pr(ctx, P_HALF_W) / pr(ctx, P_WIDTH);
+        let h = 2.0 * pr(ctx, P_HALF_H) / pr(ctx, P_HEIGHT);
+        let cone = 0.5 * (w * w + h * h).sqrt();
+        let max_steps = pr(ctx, P_MAX_STEPS) as u32;
+        let mut t = t_enter;
+        let mut i = 0u32;
+        while i < max_steps {
+            if t > t_exit {
+                break;
+            }
+            let point = add(origin, mul(dir, t));
+            let d = march_sample::<F>(ctx, point, 0).0;
+            let eps = footprint(0.0, slope, t, point);
+            let step = ((0.5 * d - cone * t - eps) / (1.0 + cone)).min(step_cap);
+            if step <= 0.5 * eps {
+                break;
+            }
+            t += step;
+            i += 1;
+        }
+        t
+    }
+
     /// A shadow ray's march: only whether the segment toward the light is blocked.
     ///
     /// The same steps, footprint and step cap as a secondary [`march`], but it carries no hit
@@ -965,14 +1004,14 @@ pub mod kernels {
         dir: V3,
         base: f32,
         slope: f32,
-    ) -> Outcome {
+    ) -> (Outcome, bool) {
         let max_steps = pr(ctx, P_SECONDARY_STEPS) as u32;
         // Secondary rays resolve a coarser surface (their footprint times P_SECONDARY_EPS).
         let eps_scale = pr(ctx, P_SECONDARY_EPS);
         let base = base * eps_scale;
         let slope = slope * eps_scale;
         let Some((t_enter, max_distance)) = march_span(ctx, origin, dir) else {
-            return Outcome::Miss;
+            return (Outcome::Miss, false);
         };
         let step_cap = 2.0 * (max_distance - t_enter) / STEP_CAP_STEPS;
         let step_factor = pr(ctx, P_STEP_FACTOR);
@@ -987,22 +1026,79 @@ pub mod kernels {
             let (d, _, _) = march_sample::<F>(ctx, point, 0);
             let eps = footprint(base, slope, t, point);
             if d < eps {
-                return Outcome::Hit;
+                return (Outcome::Hit, i == 0);
             }
             sampled = true;
             t += (step_factor * d).max(eps * 0.5).min(step_cap);
             i += 1;
         }
-        if sampled && t <= max_distance {
+        let outcome = if sampled && t <= max_distance {
             Outcome::Unresolved
         } else {
             Outcome::Miss
+        };
+        (outcome, false)
+    }
+
+    /// The origin and restart point of the ray leaving the vertex at `point` (the march's hit
+    /// point) with geometric normal `geo_n` (facing the arriving ray `dir_in`) along `dir_out`.
+    /// The one rule of every engine (OFX's CPU `Traced::leave`, WGSL `geo_leave`): `eps` off the
+    /// surface along the normal on the side `dir_out` leaves on; a ray on the normal's side
+    /// restarts `eps` back along `dir_in`, a ray on the far side (into a medium) has no restart
+    /// point (the origin again).
+    #[inline(always)]
+    fn leave_ray(point: V3, geo_n: V3, dir_in: V3, dir_out: V3, eps: f32) -> (V3, V3) {
+        if dot(dir_out, geo_n) < 0.0 {
+            let origin = sub(point, mul(geo_n, eps));
+            return (origin, origin);
         }
+        (add(point, mul(geo_n, eps)), sub(point, mul(dir_in, eps)))
+    }
+
+    /// [`march`] of a ray that left a surface at `origin`. Leave restart (OFX
+    /// `fractal3d::march_leaving`): when the march starts in a hit (the offset origin is still
+    /// inside a fold of the set) and the ray has a restart point (`leave_ray`), it is marched
+    /// again from `retreat`, once. One call site of [`march`], so its loop keeps no restart state.
+    #[inline(always)]
+    fn march_leaving<const F: u32>(
+        ctx: Context<'_>,
+        origin: V3,
+        retreat: V3,
+        dir: V3,
+        kind: u32,
+        base: f32,
+        slope: f32,
+        start: f32,
+    ) -> Hit {
+        let m = march::<F>(ctx, origin, dir, kind, base, slope, start);
+        if retreat != origin && m.hit() && m.first {
+            return march::<F>(ctx, retreat, dir, kind, base, slope, start);
+        }
+        m
+    }
+
+    /// [`march_visibility`] of a shadow ray leaving a surface, with the same leave restart as
+    /// [`march_leaving`].
+    #[inline(always)]
+    fn visibility_leaving<const F: u32>(
+        ctx: Context<'_>,
+        origin: V3,
+        retreat: V3,
+        dir: V3,
+        base: f32,
+        slope: f32,
+    ) -> Outcome {
+        let (outcome, first) = march_visibility::<F>(ctx, origin, dir, base, slope);
+        if retreat != origin && outcome == Outcome::Hit && first {
+            return march_visibility::<F>(ctx, retreat, dir, base, slope).0;
+        }
+        outcome
     }
 
     /// Sphere-trace from `origin` along `dir` and report how it ended (`Outcome`); the caller
     /// decides what an unresolved march means for its ray. Shadow rays use
-    /// [`march_visibility`].
+    /// [`march_visibility`]. `start` is a camera ray's pixel-cone start ([`cone_start`]; 0 for
+    /// every other ray): the march begins at `max(t_enter, start)`.
     #[inline(always)]
     fn march<const F: u32>(
         ctx: Context<'_>,
@@ -1011,6 +1107,7 @@ pub mod kernels {
         kind: u32,
         base: f32,
         slope: f32,
+        start: f32,
     ) -> Hit {
         let miss = Hit {
             outcome: Outcome::Miss,
@@ -1019,6 +1116,7 @@ pub mod kernels {
             eps: 0.0,
             object: 0,
             ratio: 0.0,
+            first: false,
         };
         let primary = kind == RAY_PRIMARY || kind == RAY_DIRECT;
         let max_steps = if primary {
@@ -1051,8 +1149,9 @@ pub mod kernels {
             eps,
             object,
             ratio,
+            first: false,
         };
-        let mut t = t_enter;
+        let mut t = t_enter.max(start);
         // The last sample outside the surface and its ray length (the refinement bracket).
         let mut outside: Option<(Hit, f32)> = None;
         let mut closest: Option<Hit> = None;
@@ -1063,12 +1162,25 @@ pub mod kernels {
             }
             let point = add(origin, mul(dir, t));
             let (d, trap, object) = march_sample::<F>(ctx, point, trap_mode);
+            // Start guard (OFX `fractal3d::march_with`, the rule of every engine): a first sample
+            // inside the set at a start beyond `t_enter` means the start overshot; restart from
+            // `t_enter`. It covers estimates that read `d <= 0` inside the set.
+            if d <= 0.0 && outside.is_none() && t > t_enter {
+                t = t_enter;
+                i += 1;
+                continue;
+            }
             let eps = footprint(base, slope, t, point);
             let hit = if primary { d <= eps } else { d < eps };
             if hit {
                 let bracket = match outside {
                     Some(bracket) if d <= 0.0 => bracket,
-                    _ => return sample(point, trap, eps, object, d / eps),
+                    _ => {
+                        return Hit {
+                            first: i == 0,
+                            ..sample(point, trap, eps, object, d / eps)
+                        };
+                    }
                 };
                 // Stepped inside: bisect the bracket from the last outside sample.
                 let (mut best, mut lo) = bracket;
@@ -1157,6 +1269,7 @@ pub mod kernels {
                 eps,
                 object: ctx.object,
                 ratio: 0.0,
+                first: false,
             };
         };
         let point = add(origin, mul(dir, t));
@@ -1173,6 +1286,7 @@ pub mod kernels {
             eps,
             object: ctx.object,
             ratio: 0.0,
+            first: false,
         }
     }
 
@@ -2097,13 +2211,15 @@ pub mod kernels {
     // integrator (render-rs pt-integrator pt_trace_path)
     // =========================================================================
 
-    /// One camera path. `FULL` picks the material model at compile time.
+    /// One camera path. `FULL` picks the material model at compile time; the camera ray marches
+    /// from `start` ([`cone_start`], 0 when unknown).
     #[inline(always)]
     fn trace_path<const FULL: bool, const F: u32, const MIXED: bool>(
         ctx: Context<'_>,
         lut: &[[f32; 4]],
         origin: V3,
         dir0: V3,
+        start: f32,
         r: &mut Rng,
     ) -> PathSample {
         let cam = pv3(ctx, P_CAM_ORIGIN);
@@ -2111,6 +2227,8 @@ pub mod kernels {
         let max_bounces = pr(ctx, P_MAX_BOUNCES) as u32;
 
         let mut ro = origin;
+        // The restart point of the ray `ro`, `rd` (`leave_ray`); a camera ray has none.
+        let mut rr = origin;
         let mut rd = dir0;
         let mut throughput = [1.0f32; 3];
         let mut radiance = [0.0f32; 3];
@@ -2140,7 +2258,16 @@ pub mod kernels {
                 };
                 march_exit::<F>(occupied, ro, rd, medium_eps)
             } else {
-                march::<F>(ctx, ro, rd, kind, base, slope)
+                march_leaving::<F>(
+                    ctx,
+                    ro,
+                    rr,
+                    rd,
+                    kind,
+                    base,
+                    slope,
+                    if bounce == 0 { start } else { 0.0 },
+                )
             };
             // One policy per ray kind for an unresolved march (`Outcome::Unresolved`): the camera
             // ray shows the background (Mandelbulber, Fragmentarium), a bounce ray ends the
@@ -2312,10 +2439,10 @@ pub mod kernels {
             };
             // NEE, MIS-weighted against BSDF sampling.
             if light && max3(scatter.light_f) > 0.0 {
-                let so = add(m.point, mul(geo_n, eps));
+                let (so, sr) = leave_ray(m.point, geo_n, rd, ld, eps);
                 let sb = slope * length(sub(so, cam));
                 // An unresolved shadow ray counts as blocked: no light from an unknown path.
-                let shadow = march_visibility::<F>(ctx, so, ld, sb, 0.0);
+                let shadow = visibility_leaving::<F>(ctx, so, sr, ld, sb, 0.0);
                 unresolved |= shadow == Outcome::Unresolved;
                 if shadow == Outcome::Miss {
                     let light = if point_sun {
@@ -2351,10 +2478,7 @@ pub mod kernels {
                 medium_eps = m.eps;
             }
             interface_point = m.point;
-            ro = add(
-                m.point,
-                mul(geo_n, if dot(wi, geo_n) < 0.0 { -eps } else { eps }),
-            );
+            (ro, rr) = leave_ray(m.point, geo_n, rd, wi, eps);
             rd = wi;
             bounce += 1;
         }
@@ -2380,13 +2504,14 @@ pub mod kernels {
     }
 
     /// One pixel's accumulators, written by `trace_pixel`: (rgb sum, sample count) radiance,
-    /// the albedo and normal guides, and (sum of squared luminance, unresolved march count)
-    /// for the adaptive variance and the march-limit indicator.
+    /// the albedo and normal guides, and stats: (sum of squared luminance, unresolved march
+    /// count, the camera-ray start, 0) for the adaptive variance, the march-limit indicator and
+    /// the pixel-cone start every later launch reuses.
     struct PixelOut<'a> {
         acc: &'a mut [f32; 4],
         albedo: &'a mut [f32; 4],
         normal: &'a mut [f32; 4],
-        stats: &'a mut [f32; 2],
+        stats: &'a mut [f32; 4],
     }
 
     #[inline(always)]
@@ -2442,6 +2567,28 @@ pub mod kernels {
         let up = pv3(ctx, P_CAM_UP);
         let aperture = pr(ctx, P_APERTURE);
         let background = pr(ctx, P_BACKGROUND) != 0.0;
+        // The pixel's camera-ray start, the same for every sample and launch: found once by the
+        // launch of sample 0 and kept in `stats[2]` (OFX keeps it in the albedo guide's w; here
+        // that w is the guide's sample count the denoiser divides by). INVARIANT: an
+        // accumulation's launches begin at sample 0 on zeroed stats, as the hosts reset them;
+        // a later launch on a fresh buffer reads 0, i.e. no start. A lens ray does not start at
+        // the cone's apex, so depth of field (and Direct) march from `t_enter`.
+        let start = if DIRECT || aperture > 0.0 {
+            0.0
+        } else if begin != 0 {
+            stats[2]
+        } else {
+            let cx = 2.0 * (x as f32 + 0.5) / width as f32 - 1.0;
+            let cy = 1.0 - 2.0 * (y as f32 + 0.5) / height as f32;
+            let centre = normalize(add(
+                fwd,
+                add(
+                    mul(right, cx * pr(ctx, P_HALF_W)),
+                    mul(up, cy * pr(ctx, P_HALF_H)),
+                ),
+            ));
+            cone_start::<F>(ctx, origin, centre)
+        };
         let mut sum = [acc[0], acc[1], acc[2]];
         let mut albedo_sum = [albedo[0], albedo[1], albedo[2]];
         let mut normal_sum = [normal[0], normal[1], normal[2]];
@@ -2494,10 +2641,10 @@ pub mod kernels {
             let sample = if DIRECT {
                 direct::trace_direct::<F>(ctx, lut, ro, dir)
             } else {
-                trace_path::<FULL, F, MIXED>(ctx, lut, ro, dir, &mut r)
+                trace_path::<FULL, F, MIXED>(ctx, lut, ro, dir, start, &mut r)
             };
             #[cfg(not(feature = "direct"))]
-            let sample = trace_path::<FULL, F, MIXED>(ctx, lut, ro, dir, &mut r);
+            let sample = trace_path::<FULL, F, MIXED>(ctx, lut, ro, dir, start, &mut r);
             let PathSample {
                 radiance: l,
                 hit,
@@ -2532,7 +2679,7 @@ pub mod kernels {
             s += 1;
         }
         *acc = [sum[0], sum[1], sum[2], acc[3] + spp as f32];
-        *stats = [stats[0] + luma2, stats[1] + unresolved];
+        *stats = [stats[0] + luma2, stats[1] + unresolved, start, 0.0];
         *albedo = [
             albedo_sum[0],
             albedo_sum[1],
@@ -2562,7 +2709,7 @@ pub mod kernels {
         mut albedo: DisjointSlice<[f32; 4]>,
         mut normal: DisjointSlice<[f32; 4]>,
         active: &[u32],
-        mut stats: DisjointSlice<[f32; 2]>,
+        mut stats: DisjointSlice<[f32; 4]>,
     ) {
         let idx = thread::index_1d();
         let i = idx.get() as u32;
@@ -2603,7 +2750,7 @@ pub mod kernels {
         mut albedo: DisjointSlice<[f32; 4]>,
         mut normal: DisjointSlice<[f32; 4]>,
         active: &[u32],
-        mut stats: DisjointSlice<[f32; 2]>,
+        mut stats: DisjointSlice<[f32; 4]>,
     ) {
         let idx = thread::index_1d();
         let i = idx.get() as u32;
@@ -2644,7 +2791,7 @@ pub mod kernels {
         mut albedo: DisjointSlice<[f32; 4]>,
         mut normal: DisjointSlice<[f32; 4]>,
         active: &[u32],
-        mut stats: DisjointSlice<[f32; 2]>,
+        mut stats: DisjointSlice<[f32; 4]>,
     ) {
         let idx = thread::index_1d();
         let i = idx.get() as u32;
@@ -2685,7 +2832,7 @@ pub mod kernels {
         mut albedo: DisjointSlice<[f32; 4]>,
         mut normal: DisjointSlice<[f32; 4]>,
         active: &[u32],
-        mut stats: DisjointSlice<[f32; 2]>,
+        mut stats: DisjointSlice<[f32; 4]>,
     ) {
         let idx = thread::index_1d();
         let i = idx.get() as u32;
@@ -2726,7 +2873,7 @@ pub mod kernels {
         mut albedo: DisjointSlice<[f32; 4]>,
         mut normal: DisjointSlice<[f32; 4]>,
         active: &[u32],
-        mut stats: DisjointSlice<[f32; 2]>,
+        mut stats: DisjointSlice<[f32; 4]>,
     ) {
         let idx = thread::index_1d();
         let i = idx.get() as u32;
@@ -2767,7 +2914,7 @@ pub mod kernels {
         mut albedo: DisjointSlice<[f32; 4]>,
         mut normal: DisjointSlice<[f32; 4]>,
         active: &[u32],
-        mut stats: DisjointSlice<[f32; 2]>,
+        mut stats: DisjointSlice<[f32; 4]>,
     ) {
         let idx = thread::index_1d();
         let i = idx.get() as u32;
@@ -2808,7 +2955,7 @@ pub mod kernels {
         mut albedo: DisjointSlice<[f32; 4]>,
         mut normal: DisjointSlice<[f32; 4]>,
         active: &[u32],
-        mut stats: DisjointSlice<[f32; 2]>,
+        mut stats: DisjointSlice<[f32; 4]>,
     ) {
         let idx = thread::index_1d();
         let i = idx.get() as u32;
@@ -2849,7 +2996,7 @@ pub mod kernels {
         mut albedo: DisjointSlice<[f32; 4]>,
         mut normal: DisjointSlice<[f32; 4]>,
         active: &[u32],
-        mut stats: DisjointSlice<[f32; 2]>,
+        mut stats: DisjointSlice<[f32; 4]>,
     ) {
         let idx = thread::index_1d();
         let i = idx.get() as u32;
@@ -2890,7 +3037,7 @@ pub mod kernels {
         mut albedo: DisjointSlice<[f32; 4]>,
         mut normal: DisjointSlice<[f32; 4]>,
         active: &[u32],
-        mut stats: DisjointSlice<[f32; 2]>,
+        mut stats: DisjointSlice<[f32; 4]>,
     ) {
         let idx = thread::index_1d();
         let i = idx.get() as u32;
@@ -2931,7 +3078,7 @@ pub mod kernels {
         mut albedo: DisjointSlice<[f32; 4]>,
         mut normal: DisjointSlice<[f32; 4]>,
         active: &[u32],
-        mut stats: DisjointSlice<[f32; 2]>,
+        mut stats: DisjointSlice<[f32; 4]>,
     ) {
         let idx = thread::index_1d();
         let i = idx.get() as u32;
@@ -2972,7 +3119,7 @@ pub mod kernels {
         mut albedo: DisjointSlice<[f32; 4]>,
         mut normal: DisjointSlice<[f32; 4]>,
         active: &[u32],
-        mut stats: DisjointSlice<[f32; 2]>,
+        mut stats: DisjointSlice<[f32; 4]>,
     ) {
         let idx = thread::index_1d();
         let i = idx.get() as u32;
@@ -3013,7 +3160,7 @@ pub mod kernels {
         mut albedo: DisjointSlice<[f32; 4]>,
         mut normal: DisjointSlice<[f32; 4]>,
         active: &[u32],
-        mut stats: DisjointSlice<[f32; 2]>,
+        mut stats: DisjointSlice<[f32; 4]>,
     ) {
         let idx = thread::index_1d();
         let i = idx.get() as u32;
@@ -3054,7 +3201,7 @@ pub mod kernels {
         mut albedo: DisjointSlice<[f32; 4]>,
         mut normal: DisjointSlice<[f32; 4]>,
         active: &[u32],
-        mut stats: DisjointSlice<[f32; 2]>,
+        mut stats: DisjointSlice<[f32; 4]>,
     ) {
         let idx = thread::index_1d();
         let i = idx.get() as u32;
@@ -3095,7 +3242,7 @@ pub mod kernels {
         mut albedo: DisjointSlice<[f32; 4]>,
         mut normal: DisjointSlice<[f32; 4]>,
         active: &[u32],
-        mut stats: DisjointSlice<[f32; 2]>,
+        mut stats: DisjointSlice<[f32; 4]>,
     ) {
         let idx = thread::index_1d();
         let i = idx.get() as u32;
@@ -3136,7 +3283,7 @@ pub mod kernels {
         mut albedo: DisjointSlice<[f32; 4]>,
         mut normal: DisjointSlice<[f32; 4]>,
         active: &[u32],
-        mut stats: DisjointSlice<[f32; 2]>,
+        mut stats: DisjointSlice<[f32; 4]>,
     ) {
         let idx = thread::index_1d();
         let i = idx.get() as u32;
@@ -3177,7 +3324,7 @@ pub mod kernels {
         mut albedo: DisjointSlice<[f32; 4]>,
         mut normal: DisjointSlice<[f32; 4]>,
         active: &[u32],
-        mut stats: DisjointSlice<[f32; 2]>,
+        mut stats: DisjointSlice<[f32; 4]>,
     ) {
         let idx = thread::index_1d();
         let i = idx.get() as u32;
@@ -3218,7 +3365,7 @@ pub mod kernels {
         mut albedo: DisjointSlice<[f32; 4]>,
         mut normal: DisjointSlice<[f32; 4]>,
         active: &[u32],
-        mut stats: DisjointSlice<[f32; 2]>,
+        mut stats: DisjointSlice<[f32; 4]>,
     ) {
         let idx = thread::index_1d();
         let i = idx.get() as u32;
@@ -3261,7 +3408,7 @@ pub mod kernels {
         mut albedo: DisjointSlice<[f32; 4]>,
         mut normal: DisjointSlice<[f32; 4]>,
         active: &[u32],
-        mut stats: DisjointSlice<[f32; 2]>,
+        mut stats: DisjointSlice<[f32; 4]>,
     ) {
         let idx = thread::index_1d();
         let i = idx.get() as u32;
@@ -3305,7 +3452,7 @@ pub mod kernels {
         mut albedo: DisjointSlice<[f32; 4]>,
         mut normal: DisjointSlice<[f32; 4]>,
         active: &[u32],
-        mut stats: DisjointSlice<[f32; 2]>,
+        mut stats: DisjointSlice<[f32; 4]>,
     ) {
         let idx = thread::index_1d();
         let i = idx.get() as u32;
@@ -3347,7 +3494,7 @@ pub mod kernels {
         mut albedo: DisjointSlice<[f32; 4]>,
         mut normal: DisjointSlice<[f32; 4]>,
         active: &[u32],
-        mut stats: DisjointSlice<[f32; 2]>,
+        mut stats: DisjointSlice<[f32; 4]>,
     ) {
         let idx = thread::index_1d();
         let i = idx.get() as u32;
@@ -3389,7 +3536,7 @@ pub mod kernels {
         mut albedo: DisjointSlice<[f32; 4]>,
         mut normal: DisjointSlice<[f32; 4]>,
         active: &[u32],
-        mut stats: DisjointSlice<[f32; 2]>,
+        mut stats: DisjointSlice<[f32; 4]>,
     ) {
         let idx = thread::index_1d();
         let i = idx.get() as u32;
@@ -3431,7 +3578,7 @@ pub mod kernels {
         mut albedo: DisjointSlice<[f32; 4]>,
         mut normal: DisjointSlice<[f32; 4]>,
         active: &[u32],
-        mut stats: DisjointSlice<[f32; 2]>,
+        mut stats: DisjointSlice<[f32; 4]>,
     ) {
         let idx = thread::index_1d();
         let i = idx.get() as u32;
@@ -3473,7 +3620,7 @@ pub mod kernels {
         mut albedo: DisjointSlice<[f32; 4]>,
         mut normal: DisjointSlice<[f32; 4]>,
         active: &[u32],
-        mut stats: DisjointSlice<[f32; 2]>,
+        mut stats: DisjointSlice<[f32; 4]>,
     ) {
         let idx = thread::index_1d();
         let i = idx.get() as u32;
@@ -3515,7 +3662,7 @@ pub mod kernels {
         mut albedo: DisjointSlice<[f32; 4]>,
         mut normal: DisjointSlice<[f32; 4]>,
         active: &[u32],
-        mut stats: DisjointSlice<[f32; 2]>,
+        mut stats: DisjointSlice<[f32; 4]>,
     ) {
         let idx = thread::index_1d();
         let i = idx.get() as u32;
@@ -3557,7 +3704,7 @@ pub mod kernels {
         mut albedo: DisjointSlice<[f32; 4]>,
         mut normal: DisjointSlice<[f32; 4]>,
         active: &[u32],
-        mut stats: DisjointSlice<[f32; 2]>,
+        mut stats: DisjointSlice<[f32; 4]>,
     ) {
         let idx = thread::index_1d();
         let i = idx.get() as u32;
@@ -3599,7 +3746,7 @@ pub mod kernels {
         mut albedo: DisjointSlice<[f32; 4]>,
         mut normal: DisjointSlice<[f32; 4]>,
         active: &[u32],
-        mut stats: DisjointSlice<[f32; 2]>,
+        mut stats: DisjointSlice<[f32; 4]>,
     ) {
         let idx = thread::index_1d();
         let i = idx.get() as u32;
@@ -3641,7 +3788,7 @@ pub mod kernels {
         mut albedo: DisjointSlice<[f32; 4]>,
         mut normal: DisjointSlice<[f32; 4]>,
         active: &[u32],
-        mut stats: DisjointSlice<[f32; 2]>,
+        mut stats: DisjointSlice<[f32; 4]>,
     ) {
         let idx = thread::index_1d();
         let i = idx.get() as u32;
@@ -3680,7 +3827,7 @@ pub mod kernels {
     #[kernel]
     #[launch_bounds(128)]
     #[launch_contract(domain = 1, block = (128, 1, 1))]
-    pub fn adapt(accum: &[[f32; 4]], stats: &[[f32; 2]], mut active: DisjointSlice<u32>) {
+    pub fn adapt(accum: &[[f32; 4]], stats: &[[f32; 4]], mut active: DisjointSlice<u32>) {
         let idx = thread::index_1d();
         let t = idx.get() as u32;
         if let Some(flag) = active.get_mut(idx) {
@@ -3722,7 +3869,7 @@ pub mod kernels {
     #[kernel]
     #[launch_bounds(128)]
     #[launch_contract(domain = 1, block = (128, 1, 1))]
-    pub fn tally(accum: &[[f32; 4]], stats: &[[f32; 2]], mut sums: DisjointSlice<[f64; 2]>) {
+    pub fn tally(accum: &[[f32; 4]], stats: &[[f32; 4]], mut sums: DisjointSlice<[f64; 2]>) {
         let idx = thread::index_1d();
         let stride = sums.len();
         let mut k = idx.get();
