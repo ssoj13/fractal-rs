@@ -1,0 +1,23 @@
+[package]
+name = "fractal-kernels"
+description = "CUDA kernels of the fractal path tracer (Rust compiled by cuda-oxide): path tracing, world kernels, optional Direct shading"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+path = "src/fractal_kernels.rs"
+
+[features]
+default = []
+# The deterministic Direct shading kernels (OFX Direct mode). Off by default so a host that
+# never dispatches them does not JIT-compile their entry points.
+direct = ["fractal-core/direct"]
+
+[dependencies]
+fractal-core = { workspace = true }
+cuda-device = { workspace = true }
+cuda-host = { workspace = true }
+standard-surface-bsdf = { workspace = true, features = ["cuda-math"] }

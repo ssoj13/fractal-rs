@@ -1,0 +1,18 @@
+[package]
+name = "fractal-core"
+description = "Fractal path tracer core shared by the CUDA kernels and their hosts: parameter ABI, sampler, path sampling, transmission"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+path = "src/fractal_core.rs"
+
+[features]
+# Names the Direct shading parameter slots (they are reserved either way).
+direct = []
+
+[dependencies]
+standard-surface-bsdf = { workspace = true }

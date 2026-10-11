@@ -1,0 +1,17 @@
+[workspace]
+resolver = "3"
+members = ["crates/fractal-core", "crates/fractal-kernels", "crates/fractal-materials"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/ssoj13/fractal-rs"
+publish = false
+
+[workspace.dependencies]
+fractal-core = { path = "crates/fractal-core" }
+fractal-materials = { path = "crates/fractal-materials" }
+cuda-device = { git = "ssh://git@github.com/ssoj13/cuda-rust-windows.git", branch = "main" }
+cuda-host = { git = "ssh://git@github.com/ssoj13/cuda-rust-windows.git", branch = "main" }
+standard-surface-bsdf = { git = "ssh://git@github.com/ssoj13/render-rs.git", branch = "main" }
