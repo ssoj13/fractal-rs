@@ -129,3 +129,12 @@ Next:
 - WarpBro branch fractal-merge bdd2f13 (not on main): CUDA tests 15/18 after K9/K10; fails: cuda_march_out_of_steps_is_a_reported_miss_not_a_phantom_hit, cuda_curved_hybrid_normals_match_converged_field_gradient (likely cone_start's loop bounded by P_MAX_STEPS makes starts step-budget dependent), export cancel test (timeout under load). Then bootstrap.py k register report.
 
 - [ ] OFX: cone_start budget = CONE_START_STEPS (256) on its CPU twin (fractal3d.rs cone_start) and WGSL (pathtrace.wgsl cone_start) when ofx-rs regenerates past 33fab96; tell ofx-rs-be first.
+
+## State (2026-10-11 midday)
+
+- DONE: fractal-rs main dada09d; WarpBro main 89c2491 on it (CUDA 18/18, non-GPU 245, clippy clean;
+  register report unchanged vs before the OFX merge: sm_86 full_* frame 656-728, world 672, fast_* 128-184);
+  ofx-rs main 9d1035a on fractal-rs 33fab96 (all OFX gates green).
+- NEXT: OFX twins of the fixed cone budget + regenerate past 33fab96; OFX CPU/WGSL Owen-Sobol (sampler into
+  render-rs pt-integrator, coordinate with exr-rs-ee's render-env B2); P_CAMERA_SUN as a WarpBro scene setting
+  (after the takes branch lands); WarpBro takes (branch takes, WIP 4d78d97), File > New, template conversion.
