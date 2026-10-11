@@ -2,6 +2,7 @@
 name = "fractal-core"
 description = "Fractal path tracer core shared by the CUDA kernels and their hosts: parameter ABI, sampler, path sampling, transmission"
 version.workspace = true
+authors.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true

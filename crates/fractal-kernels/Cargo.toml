@@ -2,6 +2,7 @@
 name = "fractal-kernels"
 description = "CUDA kernels of the fractal path tracer (Rust compiled by cuda-oxide): path tracing, world kernels, optional Direct shading"
 version.workspace = true
+authors.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true

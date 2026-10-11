@@ -2,6 +2,7 @@
 name = "fractal-materials"
 description = "Material presets shared by the fractal renderers (append-only: hosts store indices)"
 version.workspace = true
+authors.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
