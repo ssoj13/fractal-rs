@@ -17,11 +17,11 @@
 //!
 //! Pixels are traced in 8x4 tiles (one warp each) so neighbouring rays share their march paths.
 
-use fractal_core::params::*;
 use cuda_device::{
     ConstantMemory, DisjointSlice, constant, kernel, launch_bounds, launch_contract, thread,
 };
 use cuda_host::cuda_module;
+use fractal_core::params::*;
 
 #[cuda_module]
 #[expect(
@@ -32,10 +32,11 @@ use cuda_host::cuda_module;
 pub mod kernels {
     use super::*;
     use fractal_core::path_sampling::{
-        allows_surface_vertex, env_dir, env_uv, fast_ggx_pdf, fast_ggx_sample_local,
-        fast_spec_probability,
+        allows_surface_vertex, fast_ggx_pdf, fast_ggx_sample_local, fast_spec_probability,
     };
-    use fractal_core::transmission::{AIR, exit_distance, medium_after_scatter, volume_transmittance};
+    use fractal_core::transmission::{
+        AIR, exit_distance, medium_after_scatter, volume_transmittance,
+    };
     // Every angle here is bounded far below sin_cos's 105615 (polar angles <= pi, sampled
     // azimuths 2 pi u, Mandelbulb angles <= 64 * 8 * pi + 4 pi with the UI's power, angle-scale
     // and phase ranges), so it gives libdevice's bits without the local-memory slow path.
@@ -89,11 +90,12 @@ pub mod kernels {
     fn neg(a: V3) -> V3 {
         [-a[0], -a[1], -a[2]]
     }
-    /// Working-space (ACEScg) luminance: the BSDF crate's device-safe constant, which is also
-    /// `standard_surface_bsdf::consts::SS_LUMA` on the host (the kernel cannot reach `color.rs`, it links vfx-ocio).
+    /// Luminance in the host's working space: the weights it wrote to `P_LUMA`
+    /// (`fractal_core::luma::Luma`: ACEScg for WarpBro, Rec. 709 for OFX), one constant-cache
+    /// broadcast per component.
     #[inline(always)]
     fn luminance(a: V3) -> f32 {
-        dot(a, standard_surface_bsdf::consts::SS_LUMA)
+        dot(a, [global(P_LUMA), global(P_LUMA + 1), global(P_LUMA + 2)])
     }
     /// The per-launch parameter block (`params.rs` slots), set by the host before each launch.
     /// Every thread reads the same slot, so the constant cache broadcasts it to the warp.
@@ -1207,7 +1209,13 @@ pub mod kernels {
                 // Normalize by the largest component first: tiny but nonzero
                 // DE gradients retain their direction without an absolute cutoff.
                 let scale = g[0].abs().max(g[1].abs()).max(g[2].abs());
-                if scale > 0.0 && scale.is_finite() {
+                // Every component finite, as OFX's CPU and WGSL (`max` ignores a NaN, so
+                // `scale` alone would pass one through to `normalize`).
+                if scale > 0.0
+                    && g[0].abs() <= f32::MAX
+                    && g[1].abs() <= f32::MAX
+                    && g[2].abs() <= f32::MAX
+                {
                     return normalize([g[0] / scale, g[1] / scale, g[2] / scale]);
                 }
             }
@@ -1271,22 +1279,24 @@ pub mod kernels {
         )
     }
 
+    // =========================================================================
+    // HDRI environment (ofx-fractal environment.rs; the CDF scheme of pt-integrator's EquirectMap and
+    // its shared equirect.wgsl, statement for statement). `lut` after the palette rows holds
+    // EnvironmentMap::gpu_entries: level-0 texels with the row-conditional CDF in .w, the marginal CDF
+    // in .x, the 9 spherical-harmonic coefficients of the irradiance over pi, then mip levels 1..
+    // P_ENV_WIDTH 0 selects the sky gradient.
+    // =========================================================================
+
     #[inline(always)]
-    fn map_uv(ctx: Context<'_>, dir: V3) -> [f32; 2] {
-        env_uv(dir, pr(ctx, P_ENV_ROTATION))
+    fn env_on(ctx: Context<'_>) -> bool {
+        pr(ctx, P_ENV_WIDTH) > 0.0
     }
 
     #[inline(always)]
-    fn map_index(ctx: Context<'_>, dir: V3) -> usize {
-        let w = pr(ctx, P_ENV_WIDTH) as usize;
-        let h = pr(ctx, P_ENV_HEIGHT) as usize;
-        let [u, v] = map_uv(ctx, dir);
-        ((v * h as f32) as usize).min(h - 1) * w + ((u * w as f32) as usize).min(w - 1)
-    }
-
-    #[inline(always)]
-    fn map_texel(ctx: Context<'_>, lut: &[[f32; 4]], i: usize) -> [f32; 4] {
-        // Host appends exactly width*height texels after the palette and interior entry.
+    fn env_entry(ctx: Context<'_>, lut: &[[f32; 4]], i: usize) -> [f32; 4] {
+        // SAFETY: the host appends exactly the map's block after the palette rows (`cuda::render`
+        // validates its length against P_ENV_WIDTH / P_ENV_HEIGHT / P_ENV_LEVELS), and every caller
+        // indexes inside the level, CDF or coefficient range of that block.
         unsafe {
             *lut.get_unchecked(
                 (1 + if ctx.world {
@@ -1299,79 +1309,321 @@ pub mod kernels {
         }
     }
 
+    /// environment.rs Environment3d::env_to_world as pt-integrator's mat_vec: world into the map.
     #[inline(always)]
-    fn map_radiance(ctx: Context<'_>, lut: &[[f32; 4]], dir: V3) -> V3 {
-        let w = pr(ctx, P_ENV_WIDTH) as usize;
-        let h = pr(ctx, P_ENV_HEIGHT) as usize;
-        let [u, v] = map_uv(ctx, dir);
-        // Texel-centred bilinear reconstruction: longitude wraps, poles clamp.
-        // The fourth LUT component is the importance CDF and is never interpolated.
-        let x = (u * w as f32 - 0.5).rem_euclid(w as f32);
-        let y = (v * h as f32 - 0.5).clamp(0.0, (h - 1) as f32);
-        let x0 = (x as usize).min(w - 1);
-        let x1 = (x0 + 1) % w;
-        let y0 = (y as usize).min(h - 1);
-        let y1 = (y0 + 1).min(h - 1);
-        let tx = x - x0 as f32;
-        let ty = y - y0 as f32;
-        let a = map_texel(ctx, lut, y0 * w + x0);
-        let b = map_texel(ctx, lut, y0 * w + x1);
-        let c = map_texel(ctx, lut, y1 * w + x0);
-        let d = map_texel(ctx, lut, y1 * w + x1);
+    fn env_to_map(ctx: Context<'_>, d: V3) -> V3 {
+        let c = pr(ctx, P_ENV_COS);
+        let s = pr(ctx, P_ENV_SIN);
+        [c * d[0] - s * d[2], d[1], s * d[0] + c * d[2]]
+    }
+
+    /// Its transpose (pt-integrator's vec_mat): the map into the world.
+    #[inline(always)]
+    fn env_to_world(ctx: Context<'_>, e: V3) -> V3 {
+        let c = pr(ctx, P_ENV_COS);
+        let s = pr(ctx, P_ENV_SIN);
+        [c * e[0] + s * e[2], e[1], -s * e[0] + c * e[2]]
+    }
+
+    /// pt-integrator dir_to_equirect_uv: u from atan2(z, x), v 0 at the zenith +Y.
+    #[inline(always)]
+    fn equirect_uv(d: V3) -> [f32; 2] {
+        let theta = d[2].atan2(d[0]);
+        let phi = d[1].clamp(-1.0, 1.0).asin();
+        let mut u = theta / (2.0 * PI) + 0.5;
+        let v = 0.5 - phi / PI;
+        u -= u.floor();
+        [u, v]
+    }
+
+    /// pt-integrator equirect_uv_to_dir.
+    #[inline(always)]
+    fn equirect_dir(uv: [f32; 2]) -> V3 {
+        let (sin_theta, cos_theta) = sin_cos((uv[0] - 0.5) * 2.0 * PI);
+        let (sin_phi, cos_phi) = sin_cos((0.5 - uv[1]) * PI);
+        [cos_phi * cos_theta, sin_phi, cos_phi * sin_theta]
+    }
+
+    /// First entry, width and height of mip level `level` (environment.rs mips: each level halves
+    /// rounding up; levels 1.. follow the coefficients).
+    #[inline(always)]
+    fn env_level(ctx: Context<'_>, level: u32) -> (usize, usize, usize) {
+        let mut w = pr(ctx, P_ENV_WIDTH) as usize;
+        let mut h = pr(ctx, P_ENV_HEIGHT) as usize;
+        if level == 0 {
+            return (0, w, h);
+        }
+        let mut at = w * h + h + 9;
+        w = w.div_ceil(2);
+        h = h.div_ceil(2);
+        let mut l = 1u32;
+        while l < level {
+            at += w * h;
+            w = w.div_ceil(2);
+            h = h.div_ceil(2);
+            l += 1;
+        }
+        (at, w, h)
+    }
+
+    #[inline(always)]
+    fn mix1(a: f32, b: f32, t: f32) -> f32 {
+        a * (1.0 - t) + b * t
+    }
+
+    /// pt-integrator lighting::bilinear on mip level `level`: columns wrap, rows clamp.
+    #[inline(always)]
+    fn env_bilinear(ctx: Context<'_>, lut: &[[f32; 4]], level: u32, uv: [f32; 2]) -> V3 {
+        let (at, w, h) = env_level(ctx, level);
+        let (wi, hi) = (w as i32, h as i32);
+        let texel = |x: i32, y: i32| {
+            let column = x.rem_euclid(wi);
+            let row = y.clamp(0, hi - 1);
+            env_entry(ctx, lut, at + (row * wi + column) as usize)
+        };
+        let fx = uv[0] * w as f32 - 0.5;
+        let fy = uv[1] * h as f32 - 0.5;
+        let x0 = fx.floor();
+        let y0 = fy.floor();
+        let tx = fx - x0;
+        let ty = fy - y0;
+        let (x0, y0) = (x0 as i32, y0 as i32);
+        let (a, b, c, d) = (
+            texel(x0, y0),
+            texel(x0 + 1, y0),
+            texel(x0, y0 + 1),
+            texel(x0 + 1, y0 + 1),
+        );
         let mut color = [0.0; 3];
         let mut channel = 0;
         while channel < 3 {
-            let top = a[channel] + (b[channel] - a[channel]) * tx;
-            let bottom = c[channel] + (d[channel] - c[channel]) * tx;
-            color[channel] = top + (bottom - top) * ty;
+            let top = mix1(a[channel], b[channel], tx);
+            let bottom = mix1(c[channel], d[channel], tx);
+            color[channel] = mix1(top, bottom, ty);
             channel += 1;
         }
         color
     }
 
+    /// environment.rs MapSky::radiance: level 0 toward the world direction `d`, times the intensity.
     #[inline(always)]
-    fn map_pdf(ctx: Context<'_>, lut: &[[f32; 4]], dir: V3) -> f32 {
-        let i = map_index(ctx, dir);
-        let a = if i > 0 {
-            map_texel(ctx, lut, i - 1)[3]
+    fn env_map_radiance(ctx: Context<'_>, lut: &[[f32; 4]], d: V3) -> V3 {
+        mul(
+            env_bilinear(ctx, lut, 0, equirect_uv(env_to_map(ctx, d))),
+            pr(ctx, P_ENV_INTENSITY),
+        )
+    }
+
+    /// The background of a camera miss: the HDRI or the sky gradient, never a sun disc
+    /// (fractal3d.rs Sky::radiance).
+    #[inline(always)]
+    fn background(ctx: Context<'_>, lut: &[[f32; 4]], d: V3) -> V3 {
+        if env_on(ctx) {
+            env_map_radiance(ctx, lut, d)
         } else {
-            0.0
+            sky_radiance(ctx, d)
+        }
+    }
+
+    /// environment.rs EnvironmentMap::irradiance: irradiance over pi about the world normal `n` from
+    /// the L2 spherical harmonics, times the intensity.
+    #[inline(always)]
+    fn env_irradiance(ctx: Context<'_>, lut: &[[f32; 4]], n: V3) -> V3 {
+        let [x, y, z] = env_to_map(ctx, n);
+        let basis = [
+            0.282_094_8,
+            0.488_602_5 * y,
+            0.488_602_5 * z,
+            0.488_602_5 * x,
+            1.092_548_4 * x * y,
+            1.092_548_4 * y * z,
+            0.315_391_57 * (3.0 * z * z - 1.0),
+            1.092_548_4 * x * z,
+            0.546_274_2 * (x * x - y * y),
+        ];
+        let w = pr(ctx, P_ENV_WIDTH) as usize;
+        let h = pr(ctx, P_ENV_HEIGHT) as usize;
+        let at = w * h + h;
+        let mut e = [0.0f32; 3];
+        let mut i = 0;
+        while i < 9 {
+            let coefficient = env_entry(ctx, lut, at + i);
+            let mut c = 0;
+            while c < 3 {
+                e[c] += coefficient[c] * basis[i];
+                c += 1;
+            }
+            i += 1;
+        }
+        // Clamped at 0: the L2 sum of a sun-dominated map rings below 0 away from the sun
+        // (environment.rs EnvironmentMap::irradiance).
+        mul(
+            [e[0].max(0.0), e[1].max(0.0), e[2].max(0.0)],
+            pr(ctx, P_ENV_INTENSITY),
+        )
+    }
+
+    /// environment.rs EnvironmentMap::specular: the map toward the world direction `d` filtered for a
+    /// GGX lobe of `alpha` (the two levels around log2(max(alpha h / pi, 1)) blended), times the
+    /// intensity.
+    #[inline(always)]
+    fn env_specular(ctx: Context<'_>, lut: &[[f32; 4]], d: V3, alpha: f32) -> V3 {
+        let texels = (alpha * pr(ctx, P_ENV_HEIGHT) / PI).max(1.0);
+        let lod = texels.log2().min(pr(ctx, P_ENV_LEVELS) - 1.0);
+        let uv = equirect_uv(env_to_map(ctx, d));
+        let base = lod.floor();
+        let t = lod - base;
+        let lower = env_bilinear(ctx, lut, base as u32, uv);
+        let filtered = if t == 0.0 {
+            lower
+        } else {
+            let upper = env_bilinear(ctx, lut, base as u32 + 1, uv);
+            [
+                lower[0] + (upper[0] - lower[0]) * t,
+                lower[1] + (upper[1] - lower[1]) * t,
+                lower[2] + (upper[2] - lower[2]) * t,
+            ]
         };
-        let probability = (map_texel(ctx, lut, i)[3] - a).max(0.0);
-        let row = i / (pr(ctx, P_ENV_WIDTH) as usize);
-        let t0 = PI * row as f32 / pr(ctx, P_ENV_HEIGHT);
-        let t1 = PI * (row + 1) as f32 / pr(ctx, P_ENV_HEIGHT);
-        let omega = (2.0 * PI / pr(ctx, P_ENV_WIDTH)) * (sin_cos(t0).1 - sin_cos(t1).1);
-        probability / omega.max(1e-12)
+        mul(filtered, pr(ctx, P_ENV_INTENSITY))
+    }
+
+    /// Direct's diffuse and sheen light (fractal3d.rs Sky::irradiance): the HDRI's harmonics or the
+    /// gradient's exact convolution.
+    #[inline(always)]
+    fn sky_irradiance(ctx: Context<'_>, lut: &[[f32; 4]], n: V3) -> V3 {
+        if env_on(ctx) {
+            return env_irradiance(ctx, lut, n);
+        }
+        let t = 0.5 + n[1] / 3.0;
+        mul(
+            add(
+                pv3(ctx, P_SKY_HORIZON),
+                mul(sub(pv3(ctx, P_SKY_ZENITH), pv3(ctx, P_SKY_HORIZON)), t),
+            ),
+            global(P_SKY_INTENSITY),
+        )
+    }
+
+    /// Direct's specular and coat light (fractal3d.rs Sky::specular): the HDRI's level for `alpha`
+    /// or the gradient at `d`.
+    #[inline(always)]
+    fn sky_specular(ctx: Context<'_>, lut: &[[f32; 4]], d: V3, alpha: f32) -> V3 {
+        if env_on(ctx) {
+            env_specular(ctx, lut, d, alpha)
+        } else {
+            sky_radiance(ctx, d)
+        }
     }
 
     #[inline(always)]
-    fn map_sample(ctx: Context<'_>, lut: &[[f32; 4]], u: f32, v: f32) -> V3 {
+    fn env_marginal(ctx: Context<'_>, lut: &[[f32; 4]], i: usize) -> f32 {
         let w = pr(ctx, P_ENV_WIDTH) as usize;
         let h = pr(ctx, P_ENV_HEIGHT) as usize;
-        let mut lo = 0usize;
-        let mut hi = w * h;
+        env_entry(ctx, lut, w * h + i)[0]
+    }
+
+    #[inline(always)]
+    fn env_conditional(ctx: Context<'_>, lut: &[[f32; 4]], i: usize) -> f32 {
+        env_entry(ctx, lut, i)[3]
+    }
+
+    #[inline(always)]
+    fn env_marginal_below(ctx: Context<'_>, lut: &[[f32; 4]], i: usize) -> f32 {
+        if i == 0 {
+            0.0
+        } else {
+            env_marginal(ctx, lut, i - 1)
+        }
+    }
+
+    #[inline(always)]
+    fn env_conditional_below(ctx: Context<'_>, lut: &[[f32; 4]], row: usize, x: usize) -> f32 {
+        if x == 0 {
+            0.0
+        } else {
+            env_conditional(ctx, lut, row + x - 1)
+        }
+    }
+
+    /// pt-integrator step_offset: the position of `xi` inside the CDF step [lo, hi).
+    #[inline(always)]
+    fn env_step_offset(xi: f32, lo: f32, hi: f32) -> f32 {
+        if hi > lo {
+            ((xi - lo) / (hi - lo)).clamp(0.0, 1.0)
+        } else {
+            0.5
+        }
+    }
+
+    /// pt-integrator EquirectMap::texel_pdf: the solid-angle density inside texel (x, y) at `v`.
+    #[inline(always)]
+    fn env_texel_pdf(ctx: Context<'_>, lut: &[[f32; 4]], x: usize, y: usize, v: f32) -> f32 {
+        let w = pr(ctx, P_ENV_WIDTH) as usize;
+        let h = pr(ctx, P_ENV_HEIGHT) as usize;
+        let row = y * w;
+        let marginal_pdf = env_marginal(ctx, lut, y) - env_marginal_below(ctx, lut, y);
+        let conditional_pdf =
+            env_conditional(ctx, lut, row + x) - env_conditional_below(ctx, lut, row, x);
+        let sin_theta = sin_cos(PI * v).0;
+        if sin_theta <= 0.0 {
+            return 0.0;
+        }
+        (marginal_pdf * conditional_pdf).max(0.0) * w as f32 * h as f32
+            / (2.0 * PI * PI * sin_theta)
+    }
+
+    /// pt-integrator EquirectMap::sample then Equirect's rotation: one world direction.
+    #[inline(always)]
+    fn env_map_sample(ctx: Context<'_>, lut: &[[f32; 4]], r1: f32, r2: f32) -> V3 {
+        let w = pr(ctx, P_ENV_WIDTH) as usize;
+        let h = pr(ctx, P_ENV_HEIGHT) as usize;
+        // First row whose marginal CDF is not below r2.
+        let (mut lo, mut hi) = (0usize, h);
         while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            if map_texel(ctx, lut, mid)[3] <= u {
+            let mid = (lo + hi) / 2;
+            if env_marginal(ctx, lut, mid) < r2 {
                 lo = mid + 1;
             } else {
                 hi = mid;
             }
         }
-        let i = lo.min(w * h - 1);
-        let start = if i > 0 {
-            map_texel(ctx, lut, i - 1)[3]
-        } else {
-            0.0
-        };
-        let probability = map_texel(ctx, lut, i)[3] - start;
-        let jitter = ((u - start) / probability.max(1e-20)).clamp(0.0, 0.999999);
-        let lon = ((i % w) as f32 + jitter) / w as f32;
-        let t0 = PI * (i / w) as f32 / h as f32;
-        let t1 = PI * (i / w + 1) as f32 / h as f32;
-        let y = sin_cos(t0).1 + (sin_cos(t1).1 - sin_cos(t0).1) * v;
-        env_dir(lon, y, pr(ctx, P_ENV_ROTATION))
+        let y = lo.min(h - 1);
+        let row = y * w;
+        // First texel of the row whose conditional CDF is not below r1.
+        let (mut lo, mut hi) = (0usize, w);
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if env_conditional(ctx, lut, row + mid) < r1 {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        let x = lo.min(w - 1);
+        let dv = env_step_offset(
+            r2,
+            env_marginal_below(ctx, lut, y),
+            env_marginal(ctx, lut, y),
+        );
+        let du = env_step_offset(
+            r1,
+            env_conditional_below(ctx, lut, row, x),
+            env_conditional(ctx, lut, row + x),
+        );
+        let u = (x as f32 + du) / w as f32;
+        let v = (y as f32 + dv) / h as f32;
+        env_to_world(ctx, equirect_dir([u, v]))
+    }
+
+    /// pt-integrator Equirect::pdf: the density of env_map_sample for the world direction `d`.
+    #[inline(always)]
+    fn env_map_pdf(ctx: Context<'_>, lut: &[[f32; 4]], d: V3) -> f32 {
+        let w = pr(ctx, P_ENV_WIDTH) as u32;
+        let h = pr(ctx, P_ENV_HEIGHT) as u32;
+        let uv = equirect_uv(env_to_map(ctx, d));
+        let x = ((uv[0] * w as f32) as u32).min(w - 1) as usize;
+        let y = ((uv[1] * h as f32) as u32).min(h - 1) as usize;
+        env_texel_pdf(ctx, lut, x, y, uv[1])
     }
 
     #[inline(always)]
@@ -1401,7 +1653,7 @@ pub mod kernels {
     }
     #[inline(always)]
     fn world_sky_weight(ctx: Context<'_>) -> f32 {
-        let mean = if pr(ctx, P_ENV_WIDTH) > 0.0 {
+        let mean = if env_on(ctx) {
             pr(ctx, P_ENV_MEAN) * pr(ctx, P_ENV_INTENSITY)
         } else {
             luminance(mul(
@@ -1422,17 +1674,18 @@ pub mod kernels {
         total
     }
 
+    /// pathtrace.rs SunSky::p_sun: the gradient's sun_select, or the host's map_sun_select against
+    /// the HDRI (P_ENV_SUN_SELECT, 0 for a sun of no light).
     #[inline(always)]
     fn sun_select(ctx: Context<'_>) -> f32 {
+        if env_on(ctx) {
+            return pr(ctx, P_ENV_SUN_SELECT);
+        }
         let sun = luminance(mul(pv3(ctx, P_LIGHT_COLOR), pr(ctx, P_LIGHT_INTENSITY)));
-        let sky = if pr(ctx, P_ENV_WIDTH) > 0.0 {
-            pr(ctx, P_ENV_MEAN) * pr(ctx, P_ENV_INTENSITY)
-        } else {
-            luminance(mul(
-                add(pv3(ctx, P_SKY_HORIZON), pv3(ctx, P_SKY_ZENITH)),
-                0.5 * pr(ctx, P_SKY_INTENSITY),
-            ))
-        };
+        let sky = luminance(mul(
+            add(pv3(ctx, P_SKY_HORIZON), pv3(ctx, P_SKY_ZENITH)),
+            0.5 * pr(ctx, P_SKY_INTENSITY),
+        ));
         let total = sun + PI * sky;
         let s = if total > 0.0 { sun / total } else { 0.5 };
         s.clamp(0.1, 0.9)
@@ -1444,14 +1697,12 @@ pub mod kernels {
         0.5 * dot(d, d) <= pr(ctx, P_SUN_ONE_MINUS_COS)
     }
 
+    /// pathtrace.rs SunSky::radiance: the gradient (the sun disc inside its cone, the sky elsewhere)
+    /// or the HDRI (the map everywhere plus the sun disc inside its cone).
     #[inline(always)]
     fn env_radiance(ctx: Context<'_>, lut: &[[f32; 4]], dir: V3) -> V3 {
         if ctx.world {
-            let mut radiance = if pr(ctx, P_ENV_WIDTH) > 0.0 {
-                mul(map_radiance(ctx, lut, dir), pr(ctx, P_ENV_INTENSITY))
-            } else {
-                sky_radiance(ctx, dir)
-            };
+            let mut radiance = background(ctx, lut, dir);
             let mut i = 0usize;
             while i < global(P_LIGHT_COUNT) as usize {
                 if world_sun_contains(ctx, i, dir) {
@@ -1469,8 +1720,8 @@ pub mod kernels {
             return radiance;
         }
 
-        if pr(ctx, P_ENV_WIDTH) > 0.0 {
-            let map = mul(map_radiance(ctx, lut, dir), pr(ctx, P_ENV_INTENSITY));
+        if env_on(ctx) {
+            let map = env_map_radiance(ctx, lut, dir);
             return if sun_contains(ctx, dir) {
                 add(
                     map,
@@ -1492,13 +1743,14 @@ pub mod kernels {
         sky_radiance(ctx, dir)
     }
 
+    /// pathtrace.rs SunSky::pdf: the sun-cone and sky mixture density.
     #[inline(always)]
     fn env_pdf(ctx: Context<'_>, lut: &[[f32; 4]], dir: V3) -> f32 {
         if ctx.world {
             let total = world_light_total(ctx);
             let mut pdf = world_sky_weight(ctx) / total
-                * if pr(ctx, P_ENV_WIDTH) > 0.0 {
-                    map_pdf(ctx, lut, dir)
+                * if env_on(ctx) {
+                    env_map_pdf(ctx, lut, dir)
                 } else {
                     0.079_577_47
                 };
@@ -1514,8 +1766,8 @@ pub mod kernels {
 
         let s = sun_select(ctx);
         let mut pdf = (1.0 - s)
-            * if pr(ctx, P_ENV_WIDTH) > 0.0 {
-                map_pdf(ctx, lut, dir)
+            * if env_on(ctx) {
+                env_map_pdf(ctx, lut, dir)
             } else {
                 0.079_577_47
             };
@@ -1536,6 +1788,8 @@ pub mod kernels {
         )
     }
 
+    /// pathtrace.rs SunSky::sample: the sun cone with probability p, else the sky (uniform sphere or
+    /// the HDRI's CDFs).
     #[inline(always)]
     fn env_sample(ctx: Context<'_>, lut: &[[f32; 4]], r1: f32, r2: f32) -> (V3, f32) {
         if ctx.world {
@@ -1556,8 +1810,8 @@ pub mod kernels {
                 i += 1;
             }
             let u = (selector / world_sky_weight(ctx)).clamp(0.0, 0.99999994);
-            let dir = if pr(ctx, P_ENV_WIDTH) > 0.0 {
-                map_sample(ctx, lut, u, r2)
+            let dir = if env_on(ctx) {
+                env_map_sample(ctx, lut, u, r2)
             } else {
                 let z = 1.0 - 2.0 * u;
                 let radius = (1.0 - z * z).max(0.0).sqrt();
@@ -1575,8 +1829,8 @@ pub mod kernels {
             let sin_t = (1.0 - cos_t * cos_t).max(0.0).sqrt();
             let (sp, cp) = sin_cos(2.0 * PI * r2);
             add(add(mul(t, sin_t * cp), mul(b, sin_t * sp)), mul(d, cos_t))
-        } else if pr(ctx, P_ENV_WIDTH) > 0.0 {
-            map_sample(ctx, lut, ((r1 - s) / (1.0 - s)).min(0.99999994), r2)
+        } else if env_on(ctx) {
+            env_map_sample(ctx, lut, (r1 - s) / (1.0 - s), r2)
         } else {
             let z = 1.0 - 2.0 * ((r1 - s) / (1.0 - s));
             let r = (1.0 - z * z).max(0.0).sqrt();
@@ -1899,6 +2153,13 @@ pub mod kernels {
                 break;
             }
             if !m.hit() {
+                // A missed camera ray shows the sun disc only when the host asks for it
+                // (`P_CAMERA_SUN`, WarpBro); OFX's CPU and WGSL engines show the sky or map alone
+                // (`pathtrace.rs` Tracer::trace_from). It has no competing strategy: weight one.
+                if bounce == 0 && global(P_CAMERA_SUN) == 0.0 {
+                    radiance = add(radiance, had(throughput, background(ctx, lut, rd)));
+                    break;
+                }
                 let w = if mis_env {
                     power_heuristic(mis_bsdf_pdf, env_pdf(ctx, lut, rd))
                 } else {
@@ -2019,7 +2280,18 @@ pub mod kernels {
             // before the shadow ray marches, so only `Scatter`'s few values cross that march.
             let r1 = rand(r);
             let r2 = rand(r);
-            let (ld, lpdf) = env_sample(ctx, lut, r1, r2);
+            // A point sun (no cone: `P_SUN_CONE_PDF` 0) is a delta light, as on OFX's CPU and in
+            // WGSL (`Nee::Delta`): its irradiance along its direction when the shadow ray is
+            // clear, no MIS, no sky sample (escaping BSDF rays see the sky at weight one). An HDRI
+            // whose sun has no light (`P_ENV_SUN_SELECT` 0) is the map alone, sampled by its CDFs.
+            let point_sun = !ctx.world
+                && pr(ctx, P_SUN_CONE_PDF) <= 0.0
+                && !(env_on(ctx) && pr(ctx, P_ENV_SUN_SELECT) == 0.0);
+            let (ld, lpdf) = if point_sun {
+                (pv3(ctx, P_LIGHT_DIR), 1.0)
+            } else {
+                env_sample(ctx, lut, r1, r2)
+            };
             let light = lpdf > 0.0 && !inside && dot(ld, geo_n) > 0.0;
             let u = [rand(r), rand(r), rand(r)];
             let scatter = if full {
@@ -2042,14 +2314,13 @@ pub mod kernels {
                 let shadow = march_visibility::<F>(ctx, so, ld, sb, 0.0);
                 unresolved |= shadow == Outcome::Unresolved;
                 if shadow == Outcome::Miss {
-                    let w = power_heuristic(lpdf, scatter.light_pdf);
-                    radiance = add(
-                        radiance,
-                        had(
-                            throughput,
-                            had(scatter.light_f, mul(env_radiance(ctx, lut, ld), w / lpdf)),
-                        ),
-                    );
+                    let light = if point_sun {
+                        mul(pv3(ctx, P_LIGHT_COLOR), pr(ctx, P_LIGHT_INTENSITY))
+                    } else {
+                        let w = power_heuristic(lpdf, scatter.light_pdf);
+                        mul(env_radiance(ctx, lut, ld), w / lpdf)
+                    };
+                    radiance = add(radiance, had(throughput, had(scatter.light_f, light)));
                 }
             }
 
@@ -2069,7 +2340,8 @@ pub mod kernels {
             mis_bsdf_pdf = pdf;
             // NEE never connects through an interface, so a transmitted escape has no
             // competing light-sampling strategy and must retain weight one.
-            mis_env = !delta && !crossed;
+            // Nor does a point sun: NEE then never samples the sky.
+            mis_env = !delta && !crossed && !point_sun;
             medium = medium_after_scatter(medium, m.object as u32, crossed);
             if crossed && medium != AIR {
                 medium_eps = m.eps;

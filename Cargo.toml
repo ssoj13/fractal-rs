@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/fractal-core", "crates/fractal-kernels", "crates/fractal-materials"]
+members = ["crates/fractal-core", "crates/fractal-env", "crates/fractal-kernels", "crates/fractal-materials"]
 
 [workspace.package]
 version = "0.1.0"
@@ -17,3 +17,6 @@ cuda-device = { git = "ssh://git@github.com/ssoj13/cuda-rust-windows.git", branc
 cuda-host = { git = "ssh://git@github.com/ssoj13/cuda-rust-windows.git", branch = "main" }
 cuda-core = { git = "ssh://git@github.com/ssoj13/cuda-rust-windows.git", branch = "main" }
 standard-surface-bsdf = { git = "ssh://git@github.com/ssoj13/render-rs.git", branch = "main" }
+pt-integrator = { git = "ssh://git@github.com/ssoj13/render-rs.git", branch = "main" }
+# Only the CPU decode and CDFs, not render-env's wgpu half.
+render-env = { git = "ssh://git@github.com/ssoj13/render-rs.git", branch = "main", default-features = false }

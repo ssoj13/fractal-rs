@@ -1,0 +1,19 @@
+[package]
+name = "fractal-env"
+description = "HDRI environment of the fractal path tracer on the host: importance CDFs, SH irradiance, mips, the GPU block and its parameter slots"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+path = "src/fractal_env.rs"
+
+[dependencies]
+fractal-core = { workspace = true }
+# pt-integrator's EquirectMap (texels, CDFs, bilinear lookup) and render-env's CDF builder: the
+# same scheme OFX's CPU and WGSL engines sample, so every engine agrees on the map's density.
+pt-integrator = { workspace = true }
+render-env = { workspace = true }

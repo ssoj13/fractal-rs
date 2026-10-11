@@ -37,6 +37,60 @@ map: `C:\projects\projects.rust.cg\nv\prs\kernels-divergence.md`).
 - Path-normal finiteness: OFX's per-component check (WarpBro's lets NaN through).
 - Direct: OFX's body (HDRI, SH irradiance, mip specular) in `kernels/direct.rs`, returning `PathSample`.
 
+## Landing in ofx-rs (agreed with the ofx-rs session "ofx-rs-be", 2026-10-10)
+
+- ofx-rs keeps `crates/ofx-fractal` and `crates/fractal-materials` hands-off until we land; tell
+  ofx-rs-be when it is in. The 67 -> 69 preset assert in `ofx-effects/src/fractal/mod.rs` changes in
+  the same landing.
+- Keep the leave rule exactly: `Traced::leave` on CPU/WGSL, CUDA `leave_ray` / `march_leaving`,
+  the `Hit.first` restart, the shadow ray on the CPU's side of the normal. Gates:
+  `crates/ofx-fractal/src/pathtrace/tests.rs` (pepper on CPU/WGPU/CUDA + self-check, restart-share
+  bounds, `PARITY_RESTARTS`, over-tau chaos-floor bound, CUDA/CPU agreement with the 3-reseed noise
+  floor).
+- Run: ofx-fractal `--features wgpu,cuda -- --include-ignored` (skip `sample_hdris_load_and_cache`);
+  ofx-effects `--test fractal_scenes --test fractal_split --test fractal_environment --test
+  descriptors --release`.
+- Owen-Sobol + ACEScg luma change CUDA output: re-measure the CUDA/CPU noise floors; never loosen a
+  threshold without an attribution measurement in the test comment.
+- `regenerate.py --record-only` must leave provenance byte-identical on a clean tree.
+- Land only via `python scripts/land.py` from a branch merged with origin/main. ofx-rs's dev
+  profile is line-tables-only.
+
+## Resume point (2026-10-11, branch `merge-ofx`, WIP; main is untouched and still what WarpBro uses)
+
+Done on the branch:
+- `fractal-core::luma::Luma` {Rec709, AcesCg} + slot `P_LUMA` (3); kernels' `luminance` reads it
+  (user: luma is a per-app working-space option, WarpBro ACEScg, OFX Rec. 709).
+- `fractal-env` crate: OFX's EnvironmentMap core (CDFs, mean, SH9, mips, gpu_entries, irradiance,
+  specular) + `turn`, `to_map`, `sun_select`, `pack` (fills P_ENV_*); 6 tests pass. Hosts keep
+  their own decode and caches. Orientation verified: OFX `env_to_map` = WarpBro's former
+  `atan2(z,x) + rotation` (same sign).
+- params: OFX ENV block (P_ENV_WIDTH/HEIGHT/LEVELS/MEAN/INTENSITY/COS/SIN/SUN_SELECT),
+  `P_CAMERA_SUN`, `WORLD_ABI_VERSION` 3; `env_uv`/`env_dir` removed from path_sampling.
+- kernels: K11 finiteness; OFX env block (env_on .. env_map_pdf, background, sky_irradiance,
+  sky_specular, sun_select, env_radiance/pdf/sample) replaced WarpBro's map_*; camera miss
+  honours `P_CAMERA_SUN`; point sun (K15) with `mis_env` gate.
+- NOT yet compiled: run `cargo oxide build` in fractal-rs first.
+
+Next:
+1. Compile the kernels; fix fallout (e.g. leftover `P_ENV_ROTATION` uses, `sky_radiance` callers).
+2. K23: OFX's `trace_direct` body into `kernels/direct.rs` (uses background/sky_irradiance/
+   sky_specular), returning `PathSample`.
+3. WarpBro host: environment.rs decodes to working-space texels -> `fractal_env::EnvMap::new(..,
+   Luma::AcesCg)`; render.rs uploads `gpu_entries` after the palettes and calls `fractal_env::pack`;
+   scene.rs writes `P_LUMA` (AcesCg) and `P_CAMERA_SUN` = 1 (a scene setting, default on), and a
+   zero sun cone as `P_SUN_CONE_PDF` 0 (point sun) instead of +inf (side finding S1).
+4. K10 cone start + guard, K9 leave restart; then the OFX switch (see "Landing in ofx-rs").
+- ofx-rs main e366730 (exr-rs session): render-env no longer reads EXR itself; the host registers
+  an EXR reader. fractal-env only uses `render_env::EnvCdfs`, so it is unaffected; the OFX switch
+  must keep the reader registration working.
+- OFX CPU and WGPU engines move to Owen-Sobol (shared `fractal_core::sampler`, WGSL port) in the
+  OFX switch, so its three engines stay consistent (user, 2026-10-11).
+- cuda-oxide fork main a11d4cce8 on Linux (WSL): test/test-cuda/check-guards/clippy pass,
+  math_sin_cos SUCCESS; smoketest 232/235 (abi_hmm, disjoint_slice_len, host_closure fail),
+  fmt-check exit 1, doc-check exit 101, check-intrinsics exit 1 (known nightly-llc evidence
+  mismatch). Logs: WSL ~/pr-logs/allocas-main, `.smoketest-logs/`. To investigate.
+
 ## TODO
 
 - [x] Repo + three crates from WarpBro c999bfd, WarpBro switched to them

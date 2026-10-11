@@ -1,5 +1,6 @@
-//! Slots of the f32 parameter block shared by host (`scene.rs` packs it) and kernels (`gpu.rs`
-//! reads it): the role of ofx-fractal's uniform3d LAYOUT. Integers are stored as exact f32
+//! Slots of the f32 parameter block shared by the hosts (WarpBro `scene.rs`, OFX `cuda_scene.rs`
+//! pack it by name) and the kernels (fractal-kernels reads it): the role of ofx-fractal's
+//! uniform3d LAYOUT. Integers are stored as exact f32
 //! (all below 2^24). Vectors take 3 consecutive slots, 3x3 matrices 9 (row major).
 
 /// Lays the slots out back to back. A slot's attributes (e.g. `#[cfg(..)]`) apply to its name
@@ -59,8 +60,14 @@ slots! {
     P_LIGHT_DIR = 3, P_LIGHT_COLOR = 3, P_LIGHT_INTENSITY = 1, P_SUN_ONE_MINUS_COS = 1,
     P_SUN_CONE_PDF = 1, P_SKY_INTENSITY = 1, P_SKY_HORIZON = 3, P_SKY_ZENITH = 3,
     P_BACKGROUND = 1,
-    // Lat-long HDR map appended to the palette buffer; host fills dimensions and mean.
-    P_ENV_WIDTH = 1, P_ENV_HEIGHT = 1, P_ENV_MEAN = 1, P_ENV_INTENSITY = 1, P_ENV_ROTATION = 1,
+    // 1 shows the sun disc in the background of a camera miss (WarpBro), 0 shows the sky or map
+    // alone there (OFX, as its CPU and WGSL engines). Bounced rays always see the disc.
+    P_CAMERA_SUN = 1,
+    // Lat-long HDR map appended to the palette buffer (fractal-env `pack` fills the block):
+    // level-0 size, mip levels, mean luminance, intensity, the turn about +Y as cos/sin, and the
+    // probability of sampling the sun cone against the map (0: the map alone). Width 0 = gradient.
+    P_ENV_WIDTH = 1, P_ENV_HEIGHT = 1, P_ENV_LEVELS = 1, P_ENV_MEAN = 1, P_ENV_INTENSITY = 1,
+    P_ENV_COS = 1, P_ENV_SIN = 1, P_ENV_SUN_SELECT = 1,
     // material (Standard Surface inputs; the fast model reads base/metal/specular/roughness)
     P_BASE = 1, P_BASE_TINT = 3, P_DIFFUSE_ROUGHNESS = 1, P_METALNESS = 1,
     P_SPECULAR = 1, P_SPECULAR_COLOR = 3, P_SPECULAR_ROUGHNESS = 1, P_SPECULAR_IOR = 1,
@@ -75,6 +82,9 @@ slots! {
     P_FACING_EXPONENT = 1, P_FACING_COLOR = 3, P_FACING_ROUGHNESS = 1, P_FACING_METALLIC = 1,
     // tonemap
     P_EXPOSURE = 1, P_SATURATION = 1, P_TONEMAP = 1,
+    // Luminance weights of the host's working space (`luma::Luma::weights`); every host writes
+    // them, zeros would weigh every colour as black.
+    P_LUMA = 3,
     // Optional OFX ABI: zeros retain WarpBro's full-frame guide sample counts.
     P_OFX = 1, P_TILE_X = 1, P_TILE_Y = 1, P_TILE_WIDTH = 1, P_TILE_HEIGHT = 1,
     P_OFX_NO_CLIP = 1, P_OFX_THIN_FILM_ENERGY = 1, P_OFX_SEED_HIGH = 1, P_OFX_SKY_ALPHA = 1,
@@ -87,7 +97,7 @@ slots! {
     #[cfg(feature = "direct")] P_AO_STEPS = 1,
     #[cfg(feature = "direct")] P_AO_RADIUS = 1,
     #[cfg(feature = "direct")] P_LIGHT_HALF_ANGLE = 1,
-    // Append-only extension: pre-existing OFX/global slot offsets stay unchanged.
+    // Dielectric transmission (glass): weight, tint, extra roughness, Beer-Lambert depth.
     P_TRANSMISSION = 1, P_TRANSMISSION_COLOR = 3,
     P_TRANSMISSION_EXTRA_ROUGHNESS = 1, P_TRANSMISSION_DEPTH = 1,
     // Adaptive sampling (`adapt` kernel): relative error threshold and minimum samples per pixel.
@@ -106,7 +116,8 @@ pub const FAMILY_HYBRID: u32 = 7;
 pub const FAMILY_WORLD: u32 = 8;
 
 /// Each object starts with the existing parameter layout, then a row-major inverse affine.
-pub const WORLD_ABI_VERSION: u32 = 2;
+/// Version 3: the layout shared by WarpBro and OFX (HDRI block, camera sun).
+pub const WORLD_ABI_VERSION: u32 = 3;
 pub const O_INVERSE: usize = P_COUNT;
 pub const O_DISTANCE_SCALE: usize = O_INVERSE + 12;
 pub const O_CLIP_RADIUS: usize = O_DISTANCE_SCALE + 1;
@@ -117,6 +128,6 @@ pub const LIGHT_STRIDE: usize = P_SKY_INTENSITY - P_LIGHT_DIR;
 /// Palette LUT entries (ofx-gen PALETTE_SAMPLES) plus the interior colour.
 pub const PALETTE_SAMPLES: usize = 1024;
 
-// The six Direct shading slots are named only with the `direct` feature, but always reserved:
-// the OFX host relies on the offsets after them.
+// The six Direct shading slots are named only with the `direct` feature, but always reserved, so
+// kernels built with and without it read one layout (hosts pack by name against either build).
 const _: () = assert!(P_TRANSMISSION == P_DIRECT_GRID + 7);

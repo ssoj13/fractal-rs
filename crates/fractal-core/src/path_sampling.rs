@@ -48,31 +48,6 @@ pub fn fast_ggx_pdf(ndf: f32, g1_view: f32, n_dot_view: f32) -> f32 {
     }
 }
 
-/// Lat-long (equirectangular) lookup shared by the CUDA kernel and its CPU oracles.
-///
-/// Convention (identical to ofx-fractal's `dir_to_equirect_uv`, so both apps show one environment
-/// orientation): longitude `atan2(z, x)` runs counter-clockwise seen from +Y, so with the camera
-/// basis (forward -Z, right +X, up +Y) `u` INCREASES as the view turns right; `u = 0.25` looks
-/// along -Z, `0.5` along +X, `0.75` along +Z. `v = acos(y) / pi` (0 at +Y). `rotation` is the
-/// user's Environment rotation in radians: positive values shift `u` up, so the image content
-/// appears to turn left in the view. Returns `(u, v)` with `u` wrapped to `[0, 1)`.
-#[inline(always)]
-pub fn env_uv(dir: [f32; 3], rotation: f32) -> [f32; 2] {
-    use core::f32::consts::PI;
-    let u = (0.5 + (dir[2].atan2(dir[0]) + rotation) / (2.0 * PI)).rem_euclid(1.0);
-    [u, dir[1].clamp(-1.0, 1.0).acos() / PI]
-}
-
-/// Exact inverse of [`env_uv`] for importance sampling: the unit direction at horizontal
-/// position `u` (any real, wrapped by the trig) and height `y = cos(polar angle)`.
-#[inline(always)]
-pub fn env_dir(u: f32, y: f32, rotation: f32) -> [f32; 3] {
-    use core::f32::consts::PI;
-    let radius = (1.0 - y * y).max(0.0).sqrt();
-    let (st, ct) = (2.0 * PI * (u - 0.5) - rotation).sin_cos();
-    [radius * ct, y, radius * st]
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -237,76 +212,5 @@ mod tests {
         assert!((accepted[0] as f64 / samples as f64 - expected_acceptance).abs() < 0.006);
         assert!(accepted[0] > accepted[1], "acceptance {accepted:?}");
         assert!(variance[0] < variance[1] * 0.5, "variance {variance:?}");
-    }
-
-    /// Camera basis of scene.rs `pack`: forward -Z, right +X, up +Y, no environment rotation.
-    #[test]
-    fn env_uv_increases_as_the_view_turns_right() {
-        let near =
-            |a: [f32; 2], b: [f32; 2]| (a[0] - b[0]).abs() < 1e-6 && (a[1] - b[1]).abs() < 1e-6;
-        assert!(near(env_uv([0.0, 0.0, -1.0], 0.0), [0.25, 0.5]), "forward");
-        assert!(
-            near(env_uv([1.0, 0.0, 0.0], 0.0), [0.5, 0.5]),
-            "right 90 deg"
-        );
-        assert!(near(env_uv([0.0, 0.0, 1.0], 0.0), [0.75, 0.5]), "back");
-        assert!(
-            near(env_uv([-1.0, 0.0, 0.0], 0.0), [0.0, 0.5]),
-            "left 90 deg"
-        );
-        assert!(env_uv([0.0, 1.0, 0.0], 0.0)[1].abs() < 1e-6, "up is v = 0");
-        // Sweep the view from forward to the right: u must rise monotonically.
-        let mut last = env_uv([0.0, 0.0, -1.0], 0.0)[0];
-        for k in 1..=90 {
-            let a = (k as f32).to_radians();
-            let u = env_uv([a.sin(), 0.0, -a.cos()], 0.0)[0];
-            assert!(u > last, "u fell at {k} deg: {last} -> {u}");
-            last = u;
-        }
-        // Positive rotation shifts u up by rotation / 2pi.
-        let shifted = env_uv([0.0, 0.0, -1.0], std::f32::consts::FRAC_PI_2)[0];
-        assert!((shifted - 0.5).abs() < 1e-6, "rotation shift {shifted}");
-    }
-
-    #[test]
-    fn env_dir_inverts_env_uv() {
-        for rotation in [0.0_f32, 0.7, -2.1, 5.0] {
-            for iu in 0..64 {
-                for iv in 1..32 {
-                    let (u, v) = ((iu as f32 + 0.5) / 64.0, iv as f32 / 32.0);
-                    let d = env_dir(u, (v * std::f32::consts::PI).cos(), rotation);
-                    let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
-                    assert!((len - 1.0).abs() < 1e-5);
-                    let [u2, v2] = env_uv(d, rotation);
-                    let du = (u2 - u).abs().min(1.0 - (u2 - u).abs());
-                    assert!(
-                        du < 1e-4 && (v2 - v).abs() < 1e-4,
-                        "rot {rotation}: {u},{v} -> {u2},{v2}"
-                    );
-                }
-            }
-        }
-    }
-
-    /// `map_sample` draws a direction inside texel `i` and `map_pdf` reads texel `map_index(dir)`:
-    /// both must name the same texel, otherwise the sampled density is not the lookup density.
-    #[test]
-    fn sampled_direction_lands_in_the_texel_whose_pdf_it_uses() {
-        let (w, h) = (16usize, 8usize);
-        for rotation in [0.0_f32, 1.3, -0.9] {
-            for i in 0..w * h {
-                for (jitter, vv) in [(0.1_f32, 0.2_f32), (0.5, 0.5), (0.9, 0.8)] {
-                    let pi = std::f32::consts::PI;
-                    let u = ((i % w) as f32 + jitter) / w as f32;
-                    let t0 = pi * (i / w) as f32 / h as f32;
-                    let t1 = pi * (i / w + 1) as f32 / h as f32;
-                    let y = t0.cos() + (t1.cos() - t0.cos()) * vv;
-                    let [lu, lv] = env_uv(env_dir(u, y, rotation), rotation);
-                    let found = ((lv * h as f32) as usize).min(h - 1) * w
-                        + ((lu * w as f32) as usize).min(w - 1);
-                    assert_eq!(found, i, "rot {rotation} jitter {jitter} v {vv}");
-                }
-            }
-        }
     }
 }
