@@ -106,3 +106,9 @@ Next:
 - [ ] fractal-materials: OFX's `publish = false`/AGENTS rules, 67 -> 69 asserts in ofx-effects
 - [ ] cuda-oxide: dev-profile verifier failure on cross-crate `ConstantMemory::get_ref`
 - [ ] Side: sun half angle below ~3.5e-4 rad gives `P_SUN_CONE_PDF = +inf` in f32 (WarpBro scene.rs)
+
+## Resume (2026-10-11, usage limit)
+- ofx-rs worktree C:\projects\projects.rust.cg\cglibs\ofx-rs-fractal, branch fractal-rs (off origin/main e366730): kernels/source is a thin crate on fractal-kernels (lock pins fractal-rs 574d83c, cuda-oxide a11d4cce, render-rs 65de24a). NEXT: regenerate.py (CRATE fractal_kernels, files Cargo.toml/Cargo.lock/src/lib.rs, no params copy, parameter count from _PARAMS[n], revisions from Cargo.lock, check host fractal-core rev == kernel rev); cuda/mod.rs (params from fractal-core with feature direct, 16-word launch: active empty + stats [f32;4] zeroed, validate comment); cuda_scene.rs (P_LUMA AcesCg, P_CAMERA_SUN 0); environment.rs on fractal_env::EnvMap (Luma::AcesCg) + uniform3d env words via fractal_env::turn/sun_select; fractal-materials -> git crate, 67->69 assert; regenerate artifacts; OFX tests per 'Landing in ofx-rs'.
+- OFX CPU/WGSL already use SS_LUMA (ACEScg) via the BSDF; only the old CUDA kernel used Rec.709.
+- OFX CPU/WGSL RNG is render-rs pt-integrator PathRng/PtRng: Owen-Sobol for them = move the sampler into render-rs (fractal-core re-exports it).
+- WarpBro branch fractal-merge bdd2f13 (not on main): CUDA tests 15/18 after K9/K10; fails: cuda_march_out_of_steps_is_a_reported_miss_not_a_phantom_hit, cuda_curved_hybrid_normals_match_converged_field_gradient (likely cone_start's loop bounded by P_MAX_STEPS makes starts step-budget dependent), export cancel test (timeout under load). Then bootstrap.py k register report.
