@@ -71,17 +71,19 @@ Done on the branch:
 - kernels: K11 finiteness; OFX env block (env_on .. env_map_pdf, background, sky_irradiance,
   sky_specular, sun_select, env_radiance/pdf/sample) replaced WarpBro's map_*; camera miss
   honours `P_CAMERA_SUN`; point sun (K15) with `mis_env` gate.
-- NOT yet compiled: run `cargo oxide build` in fractal-rs first.
+- K23 Direct body (HDRI helpers behind `direct`); builds with and without the feature.
+- K10 cone start + start guard (pinhole only; cache in `stats[2]`, stats is `[f32; 4]`), K9 leave
+  rule + restart (`leave_ray`, `march_leaving`, `visibility_leaving`).
+- WarpBro branch `fractal-merge` (local `[patch]` to this checkout, never committed): environment
+  on `fractal_env`, `pack`, `P_LUMA` AcesCg, `P_CAMERA_SUN` = 1 (UI setting after the takes
+  branch lands: world.rs is shared with it), `scene::sun_cone` (zero angle = point sun; world
+  lights keep a 1e-4 rad minimum), stats `[f32; 4]`. CUDA tests after the HDRI step: 17/18 (the
+  export cancel test timed out under load).
 
 Next:
-1. Compile the kernels; fix fallout (e.g. leftover `P_ENV_ROTATION` uses, `sky_radiance` callers).
-2. K23: OFX's `trace_direct` body into `kernels/direct.rs` (uses background/sky_irradiance/
-   sky_specular), returning `PathSample`.
-3. WarpBro host: environment.rs decodes to working-space texels -> `fractal_env::EnvMap::new(..,
-   Luma::AcesCg)`; render.rs uploads `gpu_entries` after the palettes and calls `fractal_env::pack`;
-   scene.rs writes `P_LUMA` (AcesCg) and `P_CAMERA_SUN` = 1 (a scene setting, default on), and a
-   zero sun cone as `P_SUN_CONE_PDF` 0 (point sun) instead of +inf (side finding S1).
-4. K10 cone start + guard, K9 leave restart; then the OFX switch (see "Landing in ofx-rs").
+1. WarpBro CUDA tests after K9/K10; `bootstrap.py k` register/spill report vs before.
+2. Merge merge-ofx -> main, drop the WarpBro `[patch]`, update its lock, land WarpBro.
+3. The OFX switch (see "Landing in ofx-rs"), with OFX on ACEScg luma.
 - ofx-rs main e366730 (exr-rs session): render-env no longer reads EXR itself; the host registers
   an EXR reader. fractal-env only uses `render_env::EnvCdfs`, so it is unaffected; the OFX switch
   must keep the reader registration working.
