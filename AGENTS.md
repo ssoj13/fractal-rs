@@ -94,6 +94,21 @@ Next:
   fmt-check exit 1, doc-check exit 101, check-intrinsics exit 1 (known nightly-llc evidence
   mismatch). Logs: WSL ~/pr-logs/allocas-main, `.smoketest-logs/`. To investigate.
 
+## Resume point (2026-10-11 morning)
+
+- All cargo runs go through `C:/projects/projects.rust.cg/cglibs/.buildlock/buildlock.py` (machine-wide
+  build queue shared by the sessions).
+- WarpBro main pinned to fractal-rs 919f4c7 (`cf0f91e`) until `fractal-merge` lands; it switches back
+  to `branch = "main"`.
+- ofx-rs worktree `cglibs/ofx-rs-fractal`, branch `fractal-rs`, commit `fdb6f08` (local, not pushed):
+  the whole host/kernel switch; artifacts regenerated (fractal-rs 33fab96, 234 floats, 30 entries);
+  record-only idempotent; clippy (ofx-fractal + ofx-effects, wgpu+cuda) clean. regenerate.py sets
+  CUDA_OXIDE_PTX_DIR (a dependency's PTX otherwise lands in its ~/.cargo checkout).
+- Open question (step 1): WarpBro `cuda_march_out_of_steps_is_a_reported_miss_not_a_phantom_hit`
+  fails because `cone_start`'s loop is bounded by P_MAX_STEPS (start depends on the budget);
+  `cuda_curved_hybrid_normals_match_converged_field_gradient` fails at the default budget: check
+  whether the cone march (0.5 d safety) skips thin hybrid features (non-exact DE) -> geometry change.
+
 ## TODO
 
 - [x] Repo + three crates from WarpBro c999bfd, WarpBro switched to them
@@ -112,3 +127,5 @@ Next:
 - OFX CPU/WGSL already use SS_LUMA (ACEScg) via the BSDF; only the old CUDA kernel used Rec.709.
 - OFX CPU/WGSL RNG is render-rs pt-integrator PathRng/PtRng: Owen-Sobol for them = move the sampler into render-rs (fractal-core re-exports it).
 - WarpBro branch fractal-merge bdd2f13 (not on main): CUDA tests 15/18 after K9/K10; fails: cuda_march_out_of_steps_is_a_reported_miss_not_a_phantom_hit, cuda_curved_hybrid_normals_match_converged_field_gradient (likely cone_start's loop bounded by P_MAX_STEPS makes starts step-budget dependent), export cancel test (timeout under load). Then bootstrap.py k register report.
+
+- [ ] OFX: cone_start budget = CONE_START_STEPS (256) on its CPU twin (fractal3d.rs cone_start) and WGSL (pathtrace.wgsl cone_start) when ofx-rs regenerates past 33fab96; tell ofx-rs-be first.

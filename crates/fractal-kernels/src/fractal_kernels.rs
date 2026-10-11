@@ -848,6 +848,13 @@ pub mod kernels {
     /// divisors 256 and 8192 give 69 531 and 69 537 hits of 147 456 rays - the cap barely
     /// matters once rays converge; 256 is the former default's cap.
     const STEP_CAP_STEPS: f32 = 256.0;
+
+    /// The cone march's own step budget ([`cone_start`]). Independent of `P_MAX_STEPS` on purpose:
+    /// the start is an optimization, so raising or lowering the quality budget must not move it
+    /// (and with it every camera hit inside its footprint band). Steps are capped like the march's
+    /// (`2 span / STEP_CAP_STEPS`), so this budget crosses the span twice; a march that runs out of
+    /// it only starts lower, which is always safe.
+    const CONE_START_STEPS: u32 = 256;
     const HIT_REFINEMENTS: u32 = 16;
     const FOOTPRINT_RELATIVE_FLOOR: f32 = 0.000_001_907_348_6;
 
@@ -970,10 +977,9 @@ pub mod kernels {
         let w = 2.0 * pr(ctx, P_HALF_W) / pr(ctx, P_WIDTH);
         let h = 2.0 * pr(ctx, P_HALF_H) / pr(ctx, P_HEIGHT);
         let cone = 0.5 * (w * w + h * h).sqrt();
-        let max_steps = pr(ctx, P_MAX_STEPS) as u32;
         let mut t = t_enter;
         let mut i = 0u32;
-        while i < max_steps {
+        while i < CONE_START_STEPS {
             if t > t_exit {
                 break;
             }
