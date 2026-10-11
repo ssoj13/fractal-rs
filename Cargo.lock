@@ -256,6 +256,7 @@ dependencies = [
 name = "fractal-kernels"
 version = "0.1.0"
 dependencies = [
+ "cuda-core",
  "cuda-device",
  "cuda-host",
  "fractal-core",

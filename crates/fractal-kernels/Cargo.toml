@@ -20,4 +20,6 @@ direct = ["fractal-core/direct"]
 fractal-core = { workspace = true }
 cuda-device = { workspace = true }
 cuda-host = { workspace = true }
+# #[cuda_module] expands to the typed loader, which names cuda-core's context and module types.
+cuda-core = { workspace = true }
 standard-surface-bsdf = { workspace = true, features = ["cuda-math"] }
