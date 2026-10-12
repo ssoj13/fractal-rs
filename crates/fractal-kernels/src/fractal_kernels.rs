@@ -921,6 +921,18 @@ pub mod kernels {
         let mut object = 0usize;
         while object < global(P_OBJECT_COUNT) as usize {
             let c = Context { object, ..ctx };
+            // Every world estimate is clipped by its object's sphere (`bounded_distance_and_trap`)
+            // and scaled by a lower bound of the inverse transform's stretch, so the distance to
+            // that sphere bounds the object's estimate from below. An object whose sphere is no
+            // nearer than the best estimate so far cannot win: its full estimate is skipped, and
+            // the result is the same, bit for bit.
+            let row = object * OBJECT_STRIDE;
+            let reach = (length(object_point(c, x)) - ctx.objects[row + O_CLIP_RADIUS])
+                * ctx.objects[row + O_DISTANCE_SCALE];
+            if reach >= best.0 {
+                object += 1;
+                continue;
+            }
             let mode = if trap_mode == 0 {
                 0
             } else {
