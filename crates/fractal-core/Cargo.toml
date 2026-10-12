@@ -1,6 +1,6 @@
 [package]
 name = "fractal-core"
-description = "Fractal path tracer core shared by the CUDA kernels and their hosts: parameter ABI, sampler, path sampling, transmission"
+description = "Fractal path tracer core shared by the CUDA kernels and their hosts: parameter ABI, luma, path sampling, transmission"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true

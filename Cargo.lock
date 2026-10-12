@@ -553,7 +553,7 @@ dependencies = [
 [[package]]
 name = "pt-core"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ssoj13/render-rs.git?branch=main#65de24a6357099afde12a89bb6224c262a20b196"
+source = "git+ssh://git@github.com/ssoj13/render-rs.git?branch=main#ef2c6990bcdf12b89ba4de7feda650deae867c08"
 dependencies = [
  "bytemuck",
  "glam",
@@ -562,7 +562,7 @@ dependencies = [
 [[package]]
 name = "pt-integrator"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ssoj13/render-rs.git?branch=main#65de24a6357099afde12a89bb6224c262a20b196"
+source = "git+ssh://git@github.com/ssoj13/render-rs.git?branch=main#ef2c6990bcdf12b89ba4de7feda650deae867c08"
 dependencies = [
  "half",
  "pt-core",
@@ -621,7 +621,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 [[package]]
 name = "render-env"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ssoj13/render-rs.git?branch=main#65de24a6357099afde12a89bb6224c262a20b196"
+source = "git+ssh://git@github.com/ssoj13/render-rs.git?branch=main#ef2c6990bcdf12b89ba4de7feda650deae867c08"
 dependencies = [
  "bytemuck",
  "image",
@@ -701,7 +701,7 @@ checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
 [[package]]
 name = "standard-surface-bsdf"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ssoj13/render-rs.git?branch=main#65de24a6357099afde12a89bb6224c262a20b196"
+source = "git+ssh://git@github.com/ssoj13/render-rs.git?branch=main#ef2c6990bcdf12b89ba4de7feda650deae867c08"
 dependencies = [
  "cuda-device",
  "libm",

@@ -12,7 +12,7 @@ map: `C:\projects\projects.rust.cg\nv\prs\kernels-divergence.md`).
 
 | crate | content | consumers |
 |---|---|---|
-| `fractal-core` | `params` (parameter ABI), `sampler` (Owen-Sobol), `path_sampling`, `transmission` | kernels (device), WarpBro host, OFX host |
+| `fractal-core` | `params` (parameter ABI), `luma`, `path_sampling`, `transmission` (the Owen-Sobol sampler is render-rs `standard_surface_bsdf::sampling::sobol`, shared with pt-integrator's CPU/WGSL twins) | kernels (device), WarpBro host, OFX host |
 | `fractal-kernels` | `#[cuda_module] kernels` (cuda-host flavour: typed loader `kernels::load`), `direct` feature | WarpBro links it; OFX regenerates embedded PTX/cubin from it |
 | `fractal-materials` | material presets (append-only: hosts store indices) | WarpBro `materials.rs`, OFX `materials.rs` |
 
@@ -87,7 +87,7 @@ Next:
 - ofx-rs main e366730 (exr-rs session): render-env no longer reads EXR itself; the host registers
   an EXR reader. fractal-env only uses `render_env::EnvCdfs`, so it is unaffected; the OFX switch
   must keep the reader registration working.
-- OFX CPU and WGPU engines move to Owen-Sobol (shared `fractal_core::sampler`, WGSL port) in the
+- OFX CPU and WGPU engines move to Owen-Sobol (shared `standard_surface_bsdf::sampling::sobol` + WGSL twin `ss_sobol`) in the
   OFX switch, so its three engines stay consistent (user, 2026-10-11).
 - cuda-oxide fork main a11d4cce8 on Linux (WSL): test/test-cuda/check-guards/clippy pass,
   math_sin_cos SUCCESS; smoketest 232/235 (abi_hmm, disjoint_slice_len, host_closure fail),

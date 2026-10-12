@@ -147,7 +147,8 @@ pub mod kernels {
     const DERIVATIVE_LIMIT: f32 = 1.0e38;
 
     // =========================================================================
-    // RNG: Owen-scrambled Sobol per pixel (`fractal_core::sampler`), dimensions in groups of four
+    // RNG: Owen-scrambled Sobol per pixel (`standard_surface_bsdf::sampling::sobol`, shared with
+    // the CPU and WGSL path tracers of render-rs pt-integrator), dimensions in groups of four
     // =========================================================================
 
     pub struct Rng {
@@ -159,7 +160,7 @@ pub mod kernels {
 
     #[inline(always)]
     fn rand(r: &mut Rng) -> f32 {
-        let u = fractal_core::sampler::sample(r.px, r.py, r.sample, r.dim);
+        let u = standard_surface_bsdf::sampling::sobol(r.px, r.py, r.sample, r.dim);
         r.dim += 1;
         u
     }
