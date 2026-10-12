@@ -2491,13 +2491,16 @@ pub mod kernels {
             }
 
             if bounce == 0 {
-                primary_albedo = add(
-                    mul(
-                        had(mul(color, pr(ctx, P_BASE)), pv3(ctx, P_BASE_TINT)),
-                        1.0 - metal,
-                    ),
-                    mul(pv3(ctx, P_EMISSION_COLOR), pr(ctx, P_EMISSION)),
-                );
+                // The denoiser's albedo guide: the one definition (render-rs
+                // `SurfaceInputs::guide_albedo`), on the inputs `surface_inputs` gives these fields.
+                primary_albedo = SurfaceInputs {
+                    base: pr(ctx, P_BASE),
+                    base_color: had(color, pv3(ctx, P_BASE_TINT)),
+                    emission: pr(ctx, P_EMISSION),
+                    emission_color: pv3(ctx, P_EMISSION_COLOR),
+                    ..SurfaceInputs::MATERIALX_DEFAULT
+                }
+                .guide_albedo();
                 primary_normal = geo_n;
             }
 
