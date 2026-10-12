@@ -746,10 +746,22 @@ pub mod kernels {
         if i > v { i - 1.0 } else { i }
     }
 
+    /// Whether cell `c` of a Cells mask is removed: its seeded hash falls below `density`.
+    #[inline(always)]
+    fn cell_removed(c: [i32; 3], seed: u32, density: f32) -> bool {
+        use standard_surface_bsdf::sampling::lowbias32;
+        let h =
+            lowbias32((c[0] as u32) ^ lowbias32((c[1] as u32) ^ lowbias32((c[2] as u32) ^ seed)));
+        ((h >> 8) as f32 * (1.0 / 16_777_216.0)) < density
+    }
+
     /// A scene mask's distance at world point `x` (a lower bound in world units, positive where
     /// the mask removes): the shape's signed distance in mask space, scaled conservatively, and
     /// negated when inverted. Cells: the edge `size.x` grid, a cell removed when its hash falls
-    /// below the density; a removed cell bounds the kept region by the distance to its faces.
+    /// below the density. The distance is to the nearest of the 26 neighbour cells in the other
+    /// state (exact within the 3x3x3 block), else the block's boundary as the lower bound: the
+    /// zero set is exactly the border between removed and kept cells, never a face two cells of
+    /// one state share.
     #[inline(never)]
     fn mask_distance(m: &[f32], x: V3) -> f32 {
         let p = inverse_affine(&m[M_INVERSE..M_INVERSE + 12], x);
@@ -764,23 +776,33 @@ pub mod kernels {
                 let edge = s[0];
                 let f = [p[0] / edge, p[1] / edge, p[2] / edge];
                 let cell = [floor(f[0]), floor(f[1]), floor(f[2])];
-                let inside = |k: usize| {
-                    let t = f[k] - cell[k];
-                    t.min(1.0 - t)
+                let t = [f[0] - cell[0], f[1] - cell[1], f[2] - cell[2]];
+                let c = [cell[0] as i32, cell[1] as i32, cell[2] as i32];
+                let (seed, density) = (m[M_SEED] as u32, m[M_DENSITY]);
+                let removed = cell_removed(c, seed, density);
+                // Per axis, the distance to the neighbour at offset -1 / +1 (0 for offset 0).
+                let gap = |k: usize, o: i32| match o {
+                    -1 => t[k],
+                    1 => 1.0 - t[k],
+                    _ => 0.0,
                 };
-                let face = edge * inside(0).min(inside(1)).min(inside(2));
-                let seed = m[M_SEED] as u32;
-                let h = standard_surface_bsdf::sampling::lowbias32(
-                    (cell[0] as i32 as u32)
-                        ^ standard_surface_bsdf::sampling::lowbias32(
-                            (cell[1] as i32 as u32)
-                                ^ standard_surface_bsdf::sampling::lowbias32(
-                                    (cell[2] as i32 as u32) ^ seed,
-                                ),
-                        ),
-                );
-                let u = (h >> 8) as f32 * (1.0 / 16_777_216.0);
-                if u < m[M_DENSITY] { face } else { -face }
+                let mut best = 1.0
+                    + t[0]
+                        .min(1.0 - t[0])
+                        .min(t[1].min(1.0 - t[1]))
+                        .min(t[2].min(1.0 - t[2]));
+                let mut n = 0;
+                while n < 27 {
+                    let o = [n / 9 - 1, (n / 3) % 3 - 1, n % 3 - 1];
+                    if n != 13
+                        && cell_removed([c[0] + o[0], c[1] + o[1], c[2] + o[2]], seed, density)
+                            != removed
+                    {
+                        best = best.min(length([gap(0, o[0]), gap(1, o[1]), gap(2, o[2])]));
+                    }
+                    n += 1;
+                }
+                if removed { edge * best } else { -edge * best }
             }
         };
         let d = local * m[M_SCALE];
