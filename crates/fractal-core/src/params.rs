@@ -116,13 +116,35 @@ pub const FAMILY_HYBRID: u32 = 7;
 pub const FAMILY_WORLD: u32 = 8;
 
 /// Each object starts with the existing parameter layout, then a row-major inverse affine.
-/// Version 3: the layout shared by WarpBro and OFX (HDRI block, camera sun).
-pub const WORLD_ABI_VERSION: u32 = 3;
+/// Version 4: scene masks per object (`O_MASK_COUNT`, `O_MASKS`).
+pub const WORLD_ABI_VERSION: u32 = 4;
 pub const O_INVERSE: usize = P_COUNT;
 pub const O_DISTANCE_SCALE: usize = O_INVERSE + 12;
 pub const O_CLIP_RADIUS: usize = O_DISTANCE_SCALE + 1;
 pub const O_TANGENT: usize = O_CLIP_RADIUS + 1;
-pub const OBJECT_STRIDE: usize = O_TANGENT + 3;
+/// Masks the object's estimate is intersected with (0..=`MAX_MASKS`), then their rows.
+pub const O_MASK_COUNT: usize = O_TANGENT + 3;
+pub const O_MASKS: usize = O_MASK_COUNT + 1;
+pub const OBJECT_STRIDE: usize = O_MASKS + MAX_MASKS * MASK_STRIDE;
+
+/// Masks per world object: a scene mask node (sphere, box or cell grid) intersects the estimate of
+/// the objects in its scope, `d = max(d, mask)`, the mask negated when inverted.
+pub const MAX_MASKS: usize = 4;
+/// A mask row: row-major world-to-mask inverse affine (12), the distance scale (a lower bound of
+/// that inverse's stretch, so mask-space distances stay conservative in world space), shape,
+/// invert (0 / 1), size (sphere radius in x; box half extents; cell edge in x), cell density
+/// (removed share, 0..1) and seed.
+pub const M_INVERSE: usize = 0;
+pub const M_SCALE: usize = 12;
+pub const M_SHAPE: usize = 13;
+pub const M_INVERT: usize = 14;
+pub const M_SIZE: usize = 15;
+pub const M_DENSITY: usize = 18;
+pub const M_SEED: usize = 19;
+pub const MASK_STRIDE: usize = 20;
+pub const MASK_SPHERE: u32 = 0;
+pub const MASK_BOX: u32 = 1;
+pub const MASK_CELLS: u32 = 2;
 pub const LIGHT_STRIDE: usize = P_SKY_INTENSITY - P_LIGHT_DIR;
 
 /// Palette LUT entries (ofx-gen PALETTE_SAMPLES) plus the interior colour.

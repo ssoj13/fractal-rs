@@ -739,9 +739,73 @@ pub mod kernels {
         ]
     }
 
+    /// The largest integer not above `v` (|v| < 2^31): the device has no `f32::floor`.
+    #[inline(always)]
+    fn floor(v: f32) -> f32 {
+        let i = v as i32 as f32;
+        if i > v { i - 1.0 } else { i }
+    }
+
+    /// A scene mask's distance at world point `x` (a lower bound in world units, positive where
+    /// the mask removes): the shape's signed distance in mask space, scaled conservatively, and
+    /// negated when inverted. Cells: the edge `size.x` grid, a cell removed when its hash falls
+    /// below the density; a removed cell bounds the kept region by the distance to its faces.
+    #[inline(never)]
+    fn mask_distance(m: &[f32], x: V3) -> f32 {
+        let p = inverse_affine(&m[M_INVERSE..M_INVERSE + 12], x);
+        let s = [m[M_SIZE], m[M_SIZE + 1], m[M_SIZE + 2]];
+        let local = match m[M_SHAPE] as u32 {
+            MASK_SPHERE => length(p) - s[0],
+            MASK_BOX => {
+                let q = [p[0].abs() - s[0], p[1].abs() - s[1], p[2].abs() - s[2]];
+                length([q[0].max(0.0), q[1].max(0.0), q[2].max(0.0)]) + max3(q).min(0.0)
+            }
+            _ => {
+                let edge = s[0];
+                let f = [p[0] / edge, p[1] / edge, p[2] / edge];
+                let cell = [floor(f[0]), floor(f[1]), floor(f[2])];
+                let inside = |k: usize| {
+                    let t = f[k] - cell[k];
+                    t.min(1.0 - t)
+                };
+                let face = edge * inside(0).min(inside(1)).min(inside(2));
+                let seed = m[M_SEED] as u32;
+                let h = standard_surface_bsdf::sampling::lowbias32(
+                    (cell[0] as i32 as u32)
+                        ^ standard_surface_bsdf::sampling::lowbias32(
+                            (cell[1] as i32 as u32)
+                                ^ standard_surface_bsdf::sampling::lowbias32(
+                                    (cell[2] as i32 as u32) ^ seed,
+                                ),
+                        ),
+                );
+                let u = (h >> 8) as f32 * (1.0 / 16_777_216.0);
+                if u < m[M_DENSITY] { face } else { -face }
+            }
+        };
+        let d = local * m[M_SCALE];
+        if m[M_INVERT] != 0.0 { -d } else { d }
+    }
+
+    /// `d` intersected with every mask of the current world object.
+    #[inline(always)]
+    fn masked(ctx: Context<'_>, x: V3, d: f32) -> f32 {
+        let row = ctx.object * OBJECT_STRIDE;
+        let count = ctx.objects[row + O_MASK_COUNT] as usize;
+        let mut d = d;
+        let mut i = 0;
+        while i < count {
+            let m = row + O_MASKS + i * MASK_STRIDE;
+            d = d.max(mask_distance(&ctx.objects[m..m + MASK_STRIDE], x));
+            i += 1;
+        }
+        d
+    }
+
     #[inline(always)]
     fn bounded_distance_and_trap(
         ctx: Context<'_>,
+        x: V3,
         q: V3,
         d: f32,
         trap: f32,
@@ -759,14 +823,17 @@ pub mod kernels {
         } else {
             d
         };
-        (
-            d * if ctx.world {
-                ctx.objects[ctx.object * OBJECT_STRIDE + O_DISTANCE_SCALE]
-            } else {
-                pr(ctx, P_OBJ_SCALE)
-            },
-            trap,
-        )
+        let d = if ctx.world {
+            // Scene masks are world shapes: they intersect the world-scaled estimate.
+            masked(
+                ctx,
+                x,
+                d * ctx.objects[ctx.object * OBJECT_STRIDE + O_DISTANCE_SCALE],
+            )
+        } else {
+            d * pr(ctx, P_OBJ_SCALE)
+        };
+        (d, trap)
     }
 
     /// Share transformed Mandelbulb arithmetic across the runtime and specialized routes.
@@ -775,7 +842,7 @@ pub mod kernels {
     fn bulb_estimate(ctx: Context<'_>, x: V3, trap_mode: u32, world_clip: bool) -> (f32, f32) {
         let q = object_point(ctx, x);
         let (d, trap) = bulb_distance(ctx, q, trap_mode);
-        bounded_distance_and_trap(ctx, q, d, trap, world_clip)
+        bounded_distance_and_trap(ctx, x, q, d, trap, world_clip)
     }
 
     /// Signed transformed estimate and trap (fractal3d.wgsl signed_distance_and_trap).
@@ -804,7 +871,7 @@ pub mod kernels {
             FAMILY_APOLLONIAN => apollonian_distance(ctx, q, trap_mode),
             _ => hybrid_distance(ctx, q, trap_mode),
         };
-        bounded_distance_and_trap(ctx, q, d, trap, world_clip)
+        bounded_distance_and_trap(ctx, x, q, d, trap, world_clip)
     }
 
     #[inline(always)]
