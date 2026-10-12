@@ -2419,8 +2419,16 @@ pub mod kernels {
                 // (`P_CAMERA_SUN`, WarpBro); OFX's CPU and WGSL engines show the sky or map alone
                 // (`pathtrace.rs` Tracer::trace_from). It has no competing strategy: weight one.
                 if bounce == 0 && global(P_CAMERA_SUN) == 0.0 {
-                    radiance = add(radiance, had(throughput, background(ctx, lut, rd)));
+                    let seen = background(ctx, lut, rd);
+                    // A missed camera ray's albedo guide is what it shows, clamped to [0, 1]
+                    // (ofx-fractal `pathtrace.rs`: the denoiser keeps the sky as detail).
+                    primary_albedo = seen.map(|v| v.max(0.0).min(1.0));
+                    radiance = add(radiance, had(throughput, seen));
                     break;
+                }
+                if bounce == 0 {
+                    // The camera ray shows the environment and the sun disc (`P_CAMERA_SUN`).
+                    primary_albedo = env_radiance(ctx, lut, rd).map(|v| v.max(0.0).min(1.0));
                 }
                 let w = if mis_env {
                     power_heuristic(mis_bsdf_pdf, env_pdf(ctx, lut, rd))
