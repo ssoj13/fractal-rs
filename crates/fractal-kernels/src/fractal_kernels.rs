@@ -746,12 +746,10 @@ pub mod kernels {
         if i > v { i - 1.0 } else { i }
     }
 
-    /// Whether cell `c` of a Cells mask is removed: its seeded hash falls below `density`.
+    /// Whether a Cells mask removes the cell of hash `h`: its top 24 bits as a unit value fall
+    /// below `density`. A cell's hash is `lowbias32(x ^ lowbias32(y ^ lowbias32(z ^ seed)))`.
     #[inline(always)]
-    fn cell_removed(c: [i32; 3], seed: u32, density: f32) -> bool {
-        use standard_surface_bsdf::sampling::lowbias32;
-        let h =
-            lowbias32((c[0] as u32) ^ lowbias32((c[1] as u32) ^ lowbias32((c[2] as u32) ^ seed)));
+    fn cell_removed(h: u32, density: f32) -> bool {
         ((h >> 8) as f32 * (1.0 / 16_777_216.0)) < density
     }
 
@@ -779,7 +777,22 @@ pub mod kernels {
                 let t = [f[0] - cell[0], f[1] - cell[1], f[2] - cell[2]];
                 let c = [cell[0] as i32, cell[1] as i32, cell[2] as i32];
                 let (seed, density) = (m[M_SEED] as u32, m[M_DENSITY]);
-                let removed = cell_removed(c, seed, density);
+                // The hash's inner levels of the 3x3x3 block, shared by its cells: z (3), then
+                // y and z (9); each cell then costs one outer hash, and only when it is near
+                // enough to matter.
+                use standard_surface_bsdf::sampling::lowbias32;
+                let mut zy = [0u32; 9];
+                let mut k = 0;
+                while k < 3 {
+                    let z = lowbias32((c[2] + k as i32 - 1) as u32 ^ seed);
+                    let mut j = 0;
+                    while j < 3 {
+                        zy[j * 3 + k] = lowbias32((c[1] + j as i32 - 1) as u32 ^ z);
+                        j += 1;
+                    }
+                    k += 1;
+                }
+                let removed = cell_removed(lowbias32(c[0] as u32 ^ zy[4]), density);
                 // Per axis, the distance to the neighbour at offset -1 / +1 (0 for offset 0).
                 let gap = |k: usize, o: i32| match o {
                     -1 => t[k],
@@ -794,11 +807,16 @@ pub mod kernels {
                 let mut n = 0;
                 while n < 27 {
                     let o = [n / 9 - 1, (n / 3) % 3 - 1, n % 3 - 1];
+                    // A cell no nearer than the best so far cannot lower it: its hash is skipped.
+                    let near = length([gap(0, o[0]), gap(1, o[1]), gap(2, o[2])]);
                     if n != 13
-                        && cell_removed([c[0] + o[0], c[1] + o[1], c[2] + o[2]], seed, density)
-                            != removed
+                        && near < best
+                        && cell_removed(
+                            lowbias32((c[0] + o[0]) as u32 ^ zy[(n % 9) as usize]),
+                            density,
+                        ) != removed
                     {
-                        best = best.min(length([gap(0, o[0]), gap(1, o[1]), gap(2, o[2])]));
+                        best = near;
                     }
                     n += 1;
                 }
@@ -817,8 +835,13 @@ pub mod kernels {
         let mut d = d;
         let mut i = 0;
         while i < count {
-            let m = row + O_MASKS + i * MASK_STRIDE;
-            d = d.max(mask_distance(&ctx.objects[m..m + MASK_STRIDE], x));
+            let m = &ctx.objects
+                [row + O_MASKS + i * MASK_STRIDE..row + O_MASKS + (i + 1) * MASK_STRIDE];
+            // A Cells distance never exceeds 1.5 cells (`mask_distance`): where the estimate is
+            // already that far, `max` keeps it and the mask need not be evaluated.
+            if !(m[M_SHAPE] as u32 == MASK_CELLS && d >= 1.5 * m[M_SIZE] * m[M_SCALE]) {
+                d = d.max(mask_distance(m, x));
+            }
             i += 1;
         }
         d
