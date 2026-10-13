@@ -135,6 +135,8 @@ pub mod kernels {
         objects: &'a [f32],
         lights: &'a [f32],
         object: usize,
+        /// Object-scoped integer endpoint for fractional shading probes.
+        normal_iterations: Option<(usize, u32)>,
     }
 
     #[inline(always)]
@@ -219,9 +221,9 @@ pub mod kernels {
     /// before the extra one ([`fraction_due`] / [`fraction_save`]) and blends them with the
     /// final pair by frac ([`fraction_blend`]). The result is continuous in n, both lerped
     /// fields are the same family's estimates; an integer n runs exactly the former loop.
-    /// One exception at the integers: where the n-iteration estimate is 0 (inside) its gradient
-    /// is 0, so a normal stencil wholly inside it takes the (n+1)-th estimate's gradient at any
-    /// fraction above 0 (measured in WarpBro: ~2% of a bulb's hit pixels, the rest continuous).
+    /// Surface shading blends normalized endpoint normals (including the view-facing
+    /// fallback) rather than normalizing this field's blended gradient: the latter jumps
+    /// at any nonzero fraction where one endpoint has zero gradient.
     #[derive(Clone, Copy)]
     struct Fraction {
         run: u32,
@@ -231,7 +233,10 @@ pub mod kernels {
 
     #[inline(always)]
     fn fraction(ctx: Context<'_>) -> Fraction {
-        let n = pr(ctx, P_ITERATIONS).max(0.0);
+        let n = match ctx.normal_iterations {
+            Some((object, n)) if object == ctx.object => n as f32,
+            _ => pr(ctx, P_ITERATIONS).max(0.0),
+        };
         let whole = n as u32;
         let frac = n - whole as f32;
         Fraction {
@@ -1477,9 +1482,6 @@ pub mod kernels {
             }
             let point = add(origin, mul(dir, t));
             let (d, trap, object) = march_sample::<F>(ctx, point, trap_mode);
-            // Start guard (OFX `fractal3d::march_with`, the rule of every engine): a first sample
-            // inside the set at a start beyond `t_enter` means the start overshot; restart from
-            // `t_enter`. It covers estimates that read `d <= 0` inside the set.
             if d <= 0.0 && outside.is_none() && t > t_enter {
                 t = t_enter;
                 i += 1;
@@ -1611,8 +1613,113 @@ pub mod kernels {
 
     const NORMAL_STEP_HALVINGS: u32 = 3;
 
+    #[derive(Clone, Copy)]
+    struct NormalRay {
+        origin: V3,
+        retreat: V3,
+        dir: V3,
+        kind: u32,
+        base: f32,
+        slope: f32,
+        cone: Option<V3>,
+        inside: bool,
+        medium_eps: f32,
+    }
+
     #[inline(always)]
-    fn surface_normal<const F: u32>(ctx: Context<'_>, point: V3, dir: V3, eps: f32) -> V3 {
+    fn surface_normal<const F: u32>(
+        ctx: Context<'_>,
+        point: V3,
+        dir: V3,
+        eps: f32,
+        ray: NormalRay,
+    ) -> V3 {
+        let n = pr(ctx, P_ITERATIONS).max(0.0);
+        let whole = n as u32;
+        let weight = n - whole as f32;
+        if weight == 0.0 {
+            return endpoint_normal::<F>(ctx, point, dir, eps);
+        }
+        fractional_normal::<F>(ctx, ray, whole, weight)
+    }
+
+    // Share the two endpoint stencils across kernel entry points instead of
+    // duplicating their inlined DE families in every tracing specialization.
+    #[inline(never)]
+    fn fractional_normal<const F: u32>(
+        ctx: Context<'_>,
+        ray: NormalRay,
+        whole: u32,
+        weight: f32,
+    ) -> V3 {
+        let lower = endpoint_ray_normal::<F>(ctx, ray, whole);
+        let upper = endpoint_ray_normal::<F>(ctx, ray, whole + 1);
+        // The same great-circle interpolation law throughout the endpoint angle
+        // range: a threshold switching between normalized linear interpolation
+        // and spherical interpolation would itself introduce a normal jump.
+        let cosine = dot(lower, upper).clamp(-1.0, 1.0);
+        let tangent = sub(upper, mul(lower, cosine));
+        let sine = length(tangent);
+        let tangent = if sine > 0.0 {
+            mul(tangent, 1.0 / sine)
+        } else {
+            // Exactly parallel endpoints have zero rotation; exactly opposite
+            // endpoints need a deterministic great circle to avoid cancellation.
+            let axis = if lower[0].abs() < 0.8 {
+                [1.0, 0.0, 0.0]
+            } else {
+                [0.0, 1.0, 0.0]
+            };
+            normalize(sub(axis, mul(lower, dot(axis, lower))))
+        };
+        let angle = sine.atan2(cosine);
+        let (sine, cosine) = sin_cos(weight * angle);
+        normalize(add(mul(lower, cosine), mul(tangent, sine)))
+    }
+
+    #[inline(never)]
+    fn endpoint_ray_normal<const F: u32>(ctx: Context<'_>, ray: NormalRay, iterations: u32) -> V3 {
+        let ctx = Context {
+            normal_iterations: Some((ctx.object, iterations)),
+            ..ctx
+        };
+        let hit = if ray.inside {
+            march_exit::<F>(ctx, ray.origin, ray.dir, ray.medium_eps)
+        } else {
+            let start = match ray.cone {
+                Some(centre) => cone_start::<F>(ctx, ray.origin, centre),
+                None => 0.0,
+            };
+            march_leaving::<F>(
+                ctx,
+                ray.origin,
+                ray.retreat,
+                ray.dir,
+                ray.kind,
+                ray.base,
+                ray.slope,
+                start,
+            )
+        };
+        if !hit.hit() {
+            return neg(ray.dir);
+        }
+        let n = endpoint_normal::<F>(
+            Context {
+                object: hit.object,
+                ..ctx
+            },
+            hit.point,
+            if ray.inside { neg(ray.dir) } else { ray.dir },
+            hit.eps,
+        );
+        // Orient the endpoints before interpolation, as integer tracing does
+        // before storing its guide and constructing the BSDF frame.
+        if dot(n, ray.dir) > 0.0 { neg(n) } else { n }
+    }
+
+    #[inline(always)]
+    fn endpoint_normal<const F: u32>(ctx: Context<'_>, point: V3, dir: V3, eps: f32) -> V3 {
         // For world objects the stencil samples f(A^-1 x). Its world gradient is
         // A^-T grad(f), so nonuniform scale and parent shear transform normals correctly.
         let signed = family_signed::<F>(ctx);
@@ -2535,6 +2642,7 @@ pub mod kernels {
         origin: V3,
         dir0: V3,
         start: f32,
+        cone: Option<V3>,
         r: &mut Rng,
     ) -> PathSample {
         let cam = pv3(ctx, P_CAM_ORIGIN);
@@ -2660,7 +2768,23 @@ pub mod kernels {
                     ),
                 );
             }
-            let n = surface_normal::<F>(ctx, m.point, if inside { neg(rd) } else { rd }, m.eps);
+            let n = surface_normal::<F>(
+                ctx,
+                m.point,
+                if inside { neg(rd) } else { rd },
+                m.eps,
+                NormalRay {
+                    origin: ro,
+                    retreat: rr,
+                    dir: rd,
+                    kind,
+                    base,
+                    slope,
+                    cone: if bounce == 0 { cone } else { None },
+                    inside,
+                    medium_eps,
+                },
+            );
             let geo_n = if dot(n, rd) > 0.0 { neg(n) } else { n };
             let eps = 4.0 * m.eps;
             let wo = neg(rd);
@@ -2899,20 +3023,25 @@ pub mod kernels {
         // accumulation's launches begin at sample 0 on zeroed stats, as the hosts reset them;
         // a later launch on a fresh buffer reads 0, i.e. no start. A lens ray does not start at
         // the cone's apex, so depth of field (and Direct) march from `t_enter`.
+        let cx = 2.0 * (x as f32 + 0.5) / width as f32 - 1.0;
+        let cy = 1.0 - 2.0 * (y as f32 + 0.5) / height as f32;
+        let centre = normalize(add(
+            fwd,
+            add(
+                mul(right, cx * pr(ctx, P_HALF_W)),
+                mul(up, cy * pr(ctx, P_HALF_H)),
+            ),
+        ));
+        let cone = if DIRECT || aperture > 0.0 {
+            None
+        } else {
+            Some(centre)
+        };
         let start = if DIRECT || aperture > 0.0 {
             0.0
         } else if begin != 0 {
             stats[2]
         } else {
-            let cx = 2.0 * (x as f32 + 0.5) / width as f32 - 1.0;
-            let cy = 1.0 - 2.0 * (y as f32 + 0.5) / height as f32;
-            let centre = normalize(add(
-                fwd,
-                add(
-                    mul(right, cx * pr(ctx, P_HALF_W)),
-                    mul(up, cy * pr(ctx, P_HALF_H)),
-                ),
-            ));
             cone_start::<F>(ctx, origin, centre)
         };
         let mut sum = [acc[0], acc[1], acc[2]];
@@ -2967,10 +3096,10 @@ pub mod kernels {
             let sample = if DIRECT {
                 direct::trace_direct::<F>(ctx, lut, ro, dir)
             } else {
-                trace_path::<FULL, F, MIXED>(ctx, lut, ro, dir, start, &mut r)
+                trace_path::<FULL, F, MIXED>(ctx, lut, ro, dir, start, cone, &mut r)
             };
             #[cfg(not(feature = "direct"))]
-            let sample = trace_path::<FULL, F, MIXED>(ctx, lut, ro, dir, start, &mut r);
+            let sample = trace_path::<FULL, F, MIXED>(ctx, lut, ro, dir, start, cone, &mut r);
             let PathSample {
                 radiance: l,
                 hit,
@@ -3051,6 +3180,7 @@ pub mod kernels {
                     objects,
                     lights,
                     object: 0,
+                    normal_iterations: None,
                 },
                 lut,
                 i,
@@ -3092,6 +3222,7 @@ pub mod kernels {
                     objects,
                     lights,
                     object: 0,
+                    normal_iterations: None,
                 },
                 lut,
                 i,
@@ -3133,6 +3264,7 @@ pub mod kernels {
                     objects,
                     lights,
                     object: 0,
+                    normal_iterations: None,
                 },
                 lut,
                 i,
@@ -3174,6 +3306,7 @@ pub mod kernels {
                     objects,
                     lights,
                     object: 0,
+                    normal_iterations: None,
                 },
                 lut,
                 i,
@@ -3215,6 +3348,7 @@ pub mod kernels {
                     objects,
                     lights,
                     object: 0,
+                    normal_iterations: None,
                 },
                 lut,
                 i,
@@ -3256,6 +3390,7 @@ pub mod kernels {
                     objects,
                     lights,
                     object: 0,
+                    normal_iterations: None,
                 },
                 lut,
                 i,
@@ -3297,6 +3432,7 @@ pub mod kernels {
                     objects,
                     lights,
                     object: 0,
+                    normal_iterations: None,
                 },
                 lut,
                 i,
@@ -3338,6 +3474,7 @@ pub mod kernels {
                     objects,
                     lights,
                     object: 0,
+                    normal_iterations: None,
                 },
                 lut,
                 i,
@@ -3379,6 +3516,7 @@ pub mod kernels {
                     objects,
                     lights,
                     object: 0,
+                    normal_iterations: None,
                 },
                 lut,
                 i,
@@ -3420,6 +3558,7 @@ pub mod kernels {
                     objects,
                     lights,
                     object: 0,
+                    normal_iterations: None,
                 },
                 lut,
                 i,
@@ -3461,6 +3600,7 @@ pub mod kernels {
                     objects,
                     lights,
                     object: 0,
+                    normal_iterations: None,
                 },
                 lut,
                 i,
@@ -3502,6 +3642,7 @@ pub mod kernels {
                     objects,
                     lights,
                     object: 0,
+                    normal_iterations: None,
                 },
                 lut,
                 i,
@@ -3543,6 +3684,7 @@ pub mod kernels {
                     objects,
                     lights,
                     object: 0,
+                    normal_iterations: None,
                 },
                 lut,
                 i,
@@ -3584,6 +3726,7 @@ pub mod kernels {
                     objects,
                     lights,
                     object: 0,
+                    normal_iterations: None,
                 },
                 lut,
                 i,
@@ -3625,6 +3768,7 @@ pub mod kernels {
                     objects,
                     lights,
                     object: 0,
+                    normal_iterations: None,
                 },
                 lut,
                 i,
@@ -3666,6 +3810,7 @@ pub mod kernels {
                     objects,
                     lights,
                     object: 0,
+                    normal_iterations: None,
                 },
                 lut,
                 i,
@@ -3707,6 +3852,7 @@ pub mod kernels {
                     objects,
                     lights,
                     object: 0,
+                    normal_iterations: None,
                 },
                 lut,
                 i,
@@ -3742,6 +3888,7 @@ pub mod kernels {
                 objects,
                 lights,
                 object: 0,
+                normal_iterations: None,
             };
             let origin = pv3(ctx, P_CAM_ORIGIN);
             let fwd = pv3(ctx, P_CAM_FORWARD);
@@ -3800,6 +3947,7 @@ pub mod kernels {
                     objects,
                     lights,
                     object: 0,
+                    normal_iterations: None,
                 },
                 lut,
                 i,
@@ -3844,6 +3992,7 @@ pub mod kernels {
                     objects,
                     lights,
                     object: 0,
+                    normal_iterations: None,
                 },
                 lut,
                 i,
@@ -3886,6 +4035,7 @@ pub mod kernels {
                     objects,
                     lights,
                     object: 0,
+                    normal_iterations: None,
                 },
                 lut,
                 i,
@@ -3928,6 +4078,7 @@ pub mod kernels {
                     objects,
                     lights,
                     object: 0,
+                    normal_iterations: None,
                 },
                 lut,
                 i,
@@ -3970,6 +4121,7 @@ pub mod kernels {
                     objects,
                     lights,
                     object: 0,
+                    normal_iterations: None,
                 },
                 lut,
                 i,
@@ -4012,6 +4164,7 @@ pub mod kernels {
                     objects,
                     lights,
                     object: 0,
+                    normal_iterations: None,
                 },
                 lut,
                 i,
@@ -4054,6 +4207,7 @@ pub mod kernels {
                     objects,
                     lights,
                     object: 0,
+                    normal_iterations: None,
                 },
                 lut,
                 i,
@@ -4096,6 +4250,7 @@ pub mod kernels {
                     objects,
                     lights,
                     object: 0,
+                    normal_iterations: None,
                 },
                 lut,
                 i,
@@ -4138,6 +4293,7 @@ pub mod kernels {
                     objects,
                     lights,
                     object: 0,
+                    normal_iterations: None,
                 },
                 lut,
                 i,
@@ -4180,6 +4336,7 @@ pub mod kernels {
                     objects,
                     lights,
                     object: 0,
+                    normal_iterations: None,
                 },
                 lut,
                 i,
