@@ -29,6 +29,30 @@ use pt_integrator::lighting::{
 /// the mips). Hosts refuse larger files from the header, before decoding.
 pub const MAX_TEXELS: u64 = 8192 * 4096;
 
+/// What a scene's environment path names a map embedded in the binary with: `builtin:<name>`,
+/// one of [`BUILTINS`].
+pub const BUILTIN_PREFIX: &str = "builtin:";
+
+/// Maps embedded in the binary (name, Radiance `.hdr` bytes), so a scene needs no file for its
+/// environment, in every host: Poly Haven's CC0 "Venice Sunset" 2K (`assets/hdri/NOTICE.md`),
+/// about 5.6 MB.
+pub const BUILTINS: &[(&str, &[u8])] = &[(
+    "venice_sunset_2k",
+    include_bytes!("../assets/hdri/venice_sunset_2k.hdr"),
+)];
+
+/// The default environment of a new scene: the first built-in map, as a path.
+pub fn default_path() -> String {
+    format!("{BUILTIN_PREFIX}{}", BUILTINS[0].0)
+}
+
+/// The Radiance `.hdr` bytes a `builtin:<name>` path names; None for any other path (a file) and
+/// for an unknown name.
+pub fn builtin(path: &str) -> Option<&'static [u8]> {
+    let name = path.strip_prefix(BUILTIN_PREFIX)?;
+    BUILTINS.iter().find(|(n, _)| *n == name).map(|(_, bytes)| *bytes)
+}
+
 /// Range of the probability of sampling the sun cone rather than the sky: neither strategy is
 /// ever starved (the kernels' gradient `sun_select` clamps to the same range).
 pub const SUN_SELECT_RANGE: (f32, f32) = (0.1, 0.9);

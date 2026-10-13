@@ -220,3 +220,13 @@ fn pack_fills_the_environment_slots() {
         [0.0; 3]
     );
 }
+
+#[test]
+fn builtin_paths_name_the_embedded_maps() {
+    let path = default_path();
+    assert_eq!(path, "builtin:venice_sunset_2k");
+    let bytes = builtin(&path).expect("the default map is embedded");
+    assert!(bytes.starts_with(b"#?RADIANCE") || bytes.starts_with(b"#?RGBE"));
+    assert_eq!(builtin("builtin:nothing"), None);
+    assert_eq!(builtin("C:/maps/venice_sunset_2k.hdr"), None);
+}
