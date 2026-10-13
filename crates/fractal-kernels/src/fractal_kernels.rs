@@ -1249,6 +1249,106 @@ pub mod kernels {
         best
     }
 
+    #[inline(always)]
+    fn fractional_bulb(ctx: Context<'_>, family: u32) -> bool {
+        let power = pr(ctx, P_BULB_POWER);
+        family == FAMILY_BULB
+            && pr(ctx, P_BAILOUT) >= 1.0
+            && pr(ctx, P_BAILOUT) <= f32::MAX
+            && power > 0.0
+            && power <= f32::MAX
+            && fraction(ctx).frac > 0.0
+    }
+
+    #[inline(always)]
+    fn has_fractional_bulb<const F: u32>(ctx: Context<'_>) -> bool {
+        if F != FAMILY_WORLD {
+            return fractional_bulb(ctx, F);
+        }
+        let mut object = 0usize;
+        while object < global(P_OBJECT_COUNT) as usize {
+            let c = Context { object, ..ctx };
+            if fractional_bulb(c, pr(c, P_FAMILY) as u32) {
+                return true;
+            }
+            object += 1;
+        }
+        false
+    }
+
+    // A weighted hit requires each nonnegative endpoint's contribution to be
+    // no greater than eps. Under the tracer's distance-estimate assumption,
+    // (weight * distance - eps) / (weight * ray_speed + epsilon_slope) bounds advance to
+    // that endpoint's band. Taking the unadjusted endpoint maximum instead
+    // can skip an entire grazing weighted band with both samples outside it.
+    #[inline(never)]
+    fn fractional_march_distance<const F: u32>(
+        ctx: Context<'_>,
+        x: V3,
+        eps: f32,
+        epsilon_slope: f32,
+        ray_speed: f32,
+        nearest: usize,
+        weighted_distance: f32,
+    ) -> f32 {
+        let mut best = f32::MAX;
+        let count = if F == FAMILY_WORLD {
+            global(P_OBJECT_COUNT) as usize
+        } else {
+            1
+        };
+        let mut object = 0usize;
+        while object < count {
+            let c = Context { object, ..ctx };
+            let family = if F == FAMILY_WORLD {
+                pr(c, P_FAMILY) as u32
+            } else {
+                F
+            };
+            let weighted = if object == nearest {
+                weighted_distance
+            } else {
+                world_estimate(c, x, 0).0.max(0.0)
+            };
+            let distance = if fractional_bulb(c, family) {
+                let f = fraction(c);
+                let whole = f.run - 1;
+                let lower = Context {
+                    normal_iterations: Some((object, whole)),
+                    ..c
+                };
+                let upper = Context {
+                    normal_iterations: Some((object, whole + 1)),
+                    ..c
+                };
+                let (a, b) = if F == FAMILY_WORLD {
+                    (world_estimate(lower, x, 0).0, world_estimate(upper, x, 0).0)
+                } else {
+                    (
+                        signed_distance_and_trap::<F>(lower, x, 0).0,
+                        signed_distance_and_trap::<F>(upper, x, 0).0,
+                    )
+                };
+                if a >= 0.0 && a <= f32::MAX && b >= 0.0 && b <= f32::MAX {
+                    let lower_weight = 1.0 - f.frac;
+                    let lower_margin = (lower_weight * a - eps).max(0.0)
+                        / (lower_weight * ray_speed + epsilon_slope);
+                    let upper_margin =
+                        (f.frac * b - eps).max(0.0) / (f.frac * ray_speed + epsilon_slope);
+                    weighted.max(lower_margin.max(upper_margin))
+                } else {
+                    // An invalid endpoint probe cannot authorize a larger step.
+                    weighted
+                }
+            } else {
+                weighted
+            };
+            best = best.min(distance);
+            object += 1;
+        }
+        best
+    }
+
     /// The interval a ray marches over: `(t_enter, max_distance)`, or `None` when it misses the
     /// bounding sphere. Outside the sphere every estimate is an exact "outside" (escape radius /
     /// ball bound), so marching there only burns steps; Direct previews and OFX renders that
@@ -1471,10 +1571,14 @@ pub mod kernels {
             ratio,
             first: false,
         };
+        let fractional = has_fractional_bulb::<F>(ctx);
+        let ray_speed = length(dir);
+        let epsilon_slope = slope.abs().max(FOOTPRINT_RELATIVE_FLOOR * ray_speed);
         let mut t = t_enter.max(start);
         // The last sample outside the surface and its ray length (the refinement bracket).
         let mut outside: Option<(Hit, f32)> = None;
         let mut closest: Option<Hit> = None;
+        let mut accelerated = false;
         let mut i = 0u32;
         while i < max_steps {
             if t > max_distance {
@@ -1490,6 +1594,31 @@ pub mod kernels {
             let eps = footprint(base, slope, t, point);
             let hit = if primary { d <= eps } else { d < eps };
             if hit {
+                if accelerated {
+                    if let Some((_, mut lo)) = outside {
+                        let mut hi = t;
+                        let mut best = sample(point, trap, eps, object, d / eps);
+                        let mut k = 0u32;
+                        while k < HIT_REFINEMENTS && hi - lo > 0.5 * best.eps {
+                            let mid = 0.5 * (lo + hi);
+                            let point = add(origin, mul(dir, mid));
+                            let (distance, trap, object) = march_sample::<F>(ctx, point, trap_mode);
+                            let eps = footprint(base, slope, mid, point);
+                            if if primary {
+                                distance <= eps
+                            } else {
+                                distance < eps
+                            } {
+                                hi = mid;
+                                best = sample(point, trap, eps, object, distance / eps);
+                            } else {
+                                lo = mid;
+                            }
+                            k += 1;
+                        }
+                        return best;
+                    }
+                }
                 let bracket = match outside {
                     Some(bracket) if d <= 0.0 => bracket,
                     _ => {
@@ -1526,7 +1655,23 @@ pub mod kernels {
                 closest = Some(here);
             }
             outside = Some((here, t));
-            t += (step_factor * d).max(eps * 0.5).min(step_cap);
+            if fractional {
+                let step_distance = fractional_march_distance::<F>(
+                    ctx,
+                    point,
+                    eps,
+                    epsilon_slope,
+                    ray_speed,
+                    object,
+                    d,
+                );
+                let advance = (step_factor * step_distance).max(eps * 0.5).min(step_cap);
+                let original = (step_factor * d).max(eps * 0.5).min(step_cap);
+                accelerated = advance > original;
+                t += advance;
+            } else {
+                t += (step_factor * d).max(eps * 0.5).min(step_cap);
+            }
             i += 1;
         }
         match closest {
