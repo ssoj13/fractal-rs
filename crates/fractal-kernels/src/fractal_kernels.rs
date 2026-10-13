@@ -190,12 +190,74 @@ pub mod kernels {
         }
     }
 
+    /// The Mandelbulb / Mandelbox orbit constant c at point `p` and its derivative dc/dp: the
+    /// Julia mix t (`P_JULIA`) morphs c = mix(p, J, t) continuously from the Mandelbrot form
+    /// (t = 0: c = p, dc/dp = 1) to the Julia form (t = 1: c = J, dc/dp = 0); the offset k
+    /// (`P_ORBIT_OFFSET`) shifts c without changing dc/dp. Both ends and a zero offset take no
+    /// arithmetic, so they keep the former Mandelbrot / Julia constants bit for bit.
     #[inline(always)]
-    fn orbit_constant(ctx: Context<'_>, z: V3) -> (V3, f32) {
-        if pr(ctx, P_JULIA) != 0.0 {
-            (pv3(ctx, P_JULIA_C), 0.0)
+    fn orbit_constant(ctx: Context<'_>, p: V3) -> (V3, f32) {
+        let t = pr(ctx, P_JULIA);
+        let c = if t == 0.0 {
+            p
+        } else if t == 1.0 {
+            pv3(ctx, P_JULIA_C)
         } else {
-            (z, 1.0)
+            add(mul(p, 1.0 - t), mul(pv3(ctx, P_JULIA_C), t))
+        };
+        let k = pv3(ctx, P_ORBIT_OFFSET);
+        let c = if k[0] == 0.0 && k[1] == 0.0 && k[2] == 0.0 {
+            c
+        } else {
+            add(c, k)
+        };
+        (c, 1.0 - t)
+    }
+
+    /// A fractional iteration count n = whole + frac (`P_ITERATIONS`) for a family's loop: it
+    /// runs `run` iterations (whole, one more when frac > 0), records its estimate and trap
+    /// before the extra one ([`fraction_due`] / [`fraction_save`]) and blends them with the
+    /// final pair by frac ([`fraction_blend`]). The result is continuous in n, both lerped
+    /// fields are the same family's estimates; an integer n runs exactly the former loop.
+    #[derive(Clone, Copy)]
+    struct Fraction {
+        run: u32,
+        frac: f32,
+        saved: Option<(f32, f32)>,
+    }
+
+    #[inline(always)]
+    fn fraction(ctx: Context<'_>) -> Fraction {
+        let n = pr(ctx, P_ITERATIONS).max(0.0);
+        let whole = n as u32;
+        let frac = n - whole as f32;
+        Fraction {
+            run: whole + (frac > 0.0) as u32,
+            frac,
+            saved: None,
+        }
+    }
+
+    /// Whether iteration `i` (about to run) is the extra one: the caller saves its estimate of
+    /// the state after `whole` iterations first.
+    #[inline(always)]
+    fn fraction_due(f: &Fraction, i: u32) -> bool {
+        f.frac > 0.0 && i + 1 == f.run
+    }
+
+    #[inline(always)]
+    fn fraction_save(f: &mut Fraction, distance: f32, trap: f32) {
+        f.saved = Some((distance, trap));
+    }
+
+    /// The final (distance, trap), blended with the saved pair when the extra iteration ran. An
+    /// orbit that stopped earlier has no saved pair: its state after `whole` and `whole + 1`
+    /// iterations is the same.
+    #[inline(always)]
+    fn fraction_blend(f: &Fraction, distance: f32, trap: f32) -> (f32, f32) {
+        match f.saved {
+            Some((d, t)) => (d + (distance - d) * f.frac, t + (trap - t) * f.frac),
+            None => (distance, trap),
         }
     }
 
@@ -270,16 +332,27 @@ pub mod kernels {
     fn bulb_distance(ctx: Context<'_>, q: V3, trap_mode: u32) -> (f32, f32) {
         let bailout = pr(ctx, P_BAILOUT);
         let (c, dr_constant) = orbit_constant(ctx, q);
-        let iterations = pr(ctx, P_ITERATIONS) as u32;
+        let mut fraction = fraction(ctx);
+        let estimate = |r: f32, dr: f32| {
+            if r <= bailout || dr <= 0.0 {
+                0.0
+            } else {
+                0.5 * r.ln() * r / dr
+            }
+        };
         let mut z = q;
         let mut dr = 1.0f32;
         let mut r = length(z);
         let mut trap = TRAP_START;
         let mut i = 0u32;
-        while i < iterations {
+        while i < fraction.run {
+            if fraction_due(&fraction, i) {
+                fraction_save(&mut fraction, estimate(r, dr), trap);
+            }
             if r > bailout {
                 break;
             }
+            // Inside after `whole` iterations too (r <= bailout): both blended estimates are 0.
             if r < 1.0e-8 {
                 return (0.0, trap);
             }
@@ -292,10 +365,7 @@ pub mod kernels {
             }
             i += 1;
         }
-        if r <= bailout || dr <= 0.0 {
-            return (0.0, trap);
-        }
-        (0.5 * r.ln() * r / dr, trap)
+        fraction_blend(&fraction, estimate(r, dr), trap)
     }
 
     #[inline(always)]
@@ -342,12 +412,15 @@ pub mod kernels {
     #[inline(always)]
     fn box_distance(ctx: Context<'_>, q: V3, trap_mode: u32) -> (f32, f32) {
         let (c, dr_constant) = orbit_constant(ctx, q);
-        let iterations = pr(ctx, P_ITERATIONS) as u32;
+        let mut fraction = fraction(ctx);
         let mut z = q;
         let mut dr = 1.0f32;
         let mut trap = TRAP_START;
         let mut i = 0u32;
-        while i < iterations {
+        while i < fraction.run {
+            if fraction_due(&fraction, i) {
+                fraction_save(&mut fraction, length(z) / dr, trap);
+            }
             if !box_step(ctx, &mut z, &mut dr, c, dr_constant) {
                 break;
             }
@@ -356,13 +429,20 @@ pub mod kernels {
             }
             i += 1;
         }
-        (length(z) / dr, trap)
+        fraction_blend(&fraction, length(z) / dr, trap)
     }
 
     #[inline(always)]
     fn quat_distance(ctx: Context<'_>, v: V3, trap_mode: u32) -> (f32, f32) {
         let bailout = pr(ctx, P_BAILOUT);
-        let iterations = pr(ctx, P_ITERATIONS) as u32;
+        let mut fraction = fraction(ctx);
+        let estimate = |r: f32, dr: f32| {
+            if r <= bailout || dr <= 0.0 {
+                0.0
+            } else {
+                0.5 * r.ln() * r / dr
+            }
+        };
         let c = [
             pr(ctx, P_QUAT_C),
             pr(ctx, P_QUAT_C + 1),
@@ -393,7 +473,10 @@ pub mod kernels {
         let mut r = len4(q);
         let mut trap = TRAP_START;
         let mut i = 0u32;
-        while i < iterations {
+        while i < fraction.run {
+            if fraction_due(&fraction, i) {
+                fraction_save(&mut fraction, estimate(r, dr), trap);
+            }
             if r > bailout {
                 break;
             }
@@ -428,10 +511,7 @@ pub mod kernels {
             }
             i += 1;
         }
-        if r <= bailout || dr <= 0.0 {
-            return (0.0, trap);
-        }
-        (0.5 * r.ln() * r / dr, trap)
+        fraction_blend(&fraction, estimate(r, dr), trap)
     }
 
     #[inline(always)]
@@ -491,12 +571,26 @@ pub mod kernels {
 
     #[inline(always)]
     fn kifs_distance(ctx: Context<'_>, q: V3, trap_mode: u32) -> (f32, f32) {
-        let iterations = pr(ctx, P_ITERATIONS) as u32;
+        let mut fraction = fraction(ctx);
+        let estimate = |z: V3, dr: f32| {
+            let bound = if pr(ctx, P_KIFS_KIND) as u32 == 2 {
+                // exact signed distance to [-1, 1]^3
+                let d = [z[0].abs() - 1.0, z[1].abs() - 1.0, z[2].abs() - 1.0];
+                length([d[0].max(0.0), d[1].max(0.0), d[2].max(0.0)])
+                    + d[0].max(d[1].max(d[2])).min(0.0)
+            } else {
+                length(z) - pr(ctx, P_KIFS_BOUND)
+            };
+            bound / dr
+        };
         let mut z = q;
         let mut dr = 1.0f32;
         let mut trap = TRAP_START;
         let mut i = 0u32;
-        while i < iterations {
+        while i < fraction.run {
+            if fraction_due(&fraction, i) {
+                fraction_save(&mut fraction, estimate(z, dr), trap);
+            }
             if !kifs_step(ctx, &mut z, &mut dr) {
                 break;
             }
@@ -505,15 +599,7 @@ pub mod kernels {
             }
             i += 1;
         }
-        let bound = if pr(ctx, P_KIFS_KIND) as u32 == 2 {
-            // exact signed distance to [-1, 1]^3
-            let d = [z[0].abs() - 1.0, z[1].abs() - 1.0, z[2].abs() - 1.0];
-            length([d[0].max(0.0), d[1].max(0.0), d[2].max(0.0)])
-                + d[0].max(d[1].max(d[2])).min(0.0)
-        } else {
-            length(z) - pr(ctx, P_KIFS_BOUND)
-        };
-        (bound / dr, trap)
+        fraction_blend(&fraction, estimate(z, dr), trap)
     }
 
     #[inline(always)]
@@ -540,7 +626,8 @@ pub mod kernels {
         let skew = pr(ctx, P_KLEIN_SKEW);
         let line_amp = pr(ctx, P_KLEIN_LINE_AMP);
         let line_rate = pr(ctx, P_KLEIN_LINE_RATE);
-        let iterations = pr(ctx, P_ITERATIONS) as u32;
+        let mut fraction = fraction(ctx);
+        let estimate = |z: V3, dr: f32| z[1].min(0.05) / dr.max(1.0);
         let half_a = 0.5 * a;
         let half_b = 0.5 * b;
         let sign_b = exact_sign(b);
@@ -551,7 +638,10 @@ pub mod kernels {
         let mut before = z;
         let mut trap = TRAP_START;
         let mut n = 0u32;
-        while n < iterations {
+        while n < fraction.run {
+            if fraction_due(&fraction, n) {
+                fraction_save(&mut fraction, estimate(z, dr), trap);
+            }
             let (mut x, mut y, mut w) = (z[0], z[1], z[2]);
             let s = skew * y;
             x = kleinian_wrap(x + s, 2.0, -1.0) - s;
@@ -590,7 +680,7 @@ pub mod kernels {
             previous = z;
             n += 1;
         }
-        (z[1].min(0.05) / dr.max(1.0), trap)
+        fraction_blend(&fraction, estimate(z, dr), trap)
     }
 
     #[inline(always)]
@@ -598,12 +688,21 @@ pub mod kernels {
         let bx = pv3(ctx, P_PK_BOX);
         let size = pr(ctx, P_PK_SIZE);
         let c = pv3(ctx, P_PK_C);
-        let iterations = pr(ctx, P_ITERATIONS) as u32;
+        let mut fraction = fraction(ctx);
+        let estimate = |z: V3, dr: f32| {
+            let o = sub(z, pv3(ctx, P_PK_OFFSET));
+            let t = pr(ctx, P_PK_THICKNESS);
+            let thingy = ((o[0] * o[0] + o[1] * o[1]).sqrt() * o[2]).abs() - t;
+            0.5 * thingy / (dot(o, o) + t.abs()).sqrt().max(1.0e-30) / dr
+        };
         let mut z = q;
         let mut dr = 1.0f32;
         let mut trap = TRAP_START;
         let mut i = 0u32;
-        while i < iterations {
+        while i < fraction.run {
+            if fraction_due(&fraction, i) {
+                fraction_save(&mut fraction, estimate(z, dr), trap);
+            }
             z = [
                 2.0 * z[0].clamp(-bx[0], bx[0]) - z[0],
                 2.0 * z[1].clamp(-bx[1], bx[1]) - z[1],
@@ -624,13 +723,7 @@ pub mod kernels {
             }
             i += 1;
         }
-        let o = sub(z, pv3(ctx, P_PK_OFFSET));
-        let t = pr(ctx, P_PK_THICKNESS);
-        let thingy = ((o[0] * o[0] + o[1] * o[1]).sqrt() * o[2]).abs() - t;
-        (
-            0.5 * thingy / (dot(o, o) + t.abs()).sqrt().max(1.0e-30) / dr,
-            trap,
-        )
+        fraction_blend(&fraction, estimate(z, dr), trap)
     }
 
     /// Apollonian wrap + inversion k = max(s / r2, 0.1). Returns false to stop.
@@ -657,12 +750,16 @@ pub mod kernels {
 
     #[inline(always)]
     fn apollonian_distance(ctx: Context<'_>, q: V3, trap_mode: u32) -> (f32, f32) {
-        let iterations = pr(ctx, P_ITERATIONS) as u32;
+        let mut fraction = fraction(ctx);
+        let estimate = |z: V3, dr: f32| 0.25 * z[1].abs() / dr;
         let mut z = add(q, [0.0, 1.0, 0.0]);
         let mut dr = 1.0f32;
         let mut trap = TRAP_START;
         let mut i = 0u32;
-        while i < iterations {
+        while i < fraction.run {
+            if fraction_due(&fraction, i) {
+                fraction_save(&mut fraction, estimate(z, dr), trap);
+            }
             if !apollonian_step(ctx, &mut z, &mut dr) {
                 break;
             }
@@ -671,13 +768,13 @@ pub mod kernels {
             }
             i += 1;
         }
-        (0.25 * z[1].abs() / dr, trap)
+        fraction_blend(&fraction, estimate(z, dr), trap)
     }
 
     #[inline(always)]
     fn hybrid_distance(ctx: Context<'_>, q: V3, trap_mode: u32) -> (f32, f32) {
         let bailout = pr(ctx, P_BAILOUT);
-        let iterations = pr(ctx, P_ITERATIONS) as u32;
+        let mut fraction = fraction(ctx);
         let steps = pr(ctx, P_HYBRID_STEPS) as u32;
         let count = (pr(ctx, P_HYBRID_COUNT) as u32).max(1);
         let c = q;
@@ -685,8 +782,11 @@ pub mod kernels {
         let mut dr = 1.0f32;
         let mut trap = TRAP_START;
         let mut i = 0u32;
-        while i < iterations {
+        while i < fraction.run {
             let r = length(z);
+            if fraction_due(&fraction, i) {
+                fraction_save(&mut fraction, 0.5 * r / dr, trap);
+            }
             if r > bailout {
                 break;
             }
@@ -710,7 +810,7 @@ pub mod kernels {
             }
             i += 1;
         }
-        (0.5 * length(z) / dr, trap)
+        fraction_blend(&fraction, 0.5 * length(z) / dr, trap)
     }
 
     /// Scene point -> object space: R^T (p - offset) / scale.
@@ -847,8 +947,59 @@ pub mod kernels {
         d
     }
 
+    /// The estimate of formula `family` at its own point `q` (object space, before the
+    /// object's clip and scale).
     #[inline(always)]
-    fn bounded_distance_and_trap(
+    fn family_distance(ctx: Context<'_>, family: u32, q: V3, trap_mode: u32) -> (f32, f32) {
+        match family {
+            FAMILY_BULB => bulb_distance(ctx, q, trap_mode),
+            FAMILY_BOX => box_distance(ctx, q, trap_mode),
+            FAMILY_QUAT => quat_distance(ctx, q, trap_mode),
+            FAMILY_KIFS => kifs_distance(ctx, q, trap_mode),
+            FAMILY_KLEINIAN => kleinian_distance(ctx, q, trap_mode),
+            FAMILY_PSEUDO_KLEINIAN => pseudo_kleinian_distance(ctx, q, trap_mode),
+            FAMILY_APOLLONIAN => apollonian_distance(ctx, q, trap_mode),
+            _ => hybrid_distance(ctx, q, trap_mode),
+        }
+    }
+
+    /// `d` intersected with the formula's own ball (`P_BOUND_RADIUS`, zero for none) around its
+    /// point `p`.
+    #[inline(always)]
+    fn formula_bound(ctx: Context<'_>, p: V3, d: f32) -> f32 {
+        let radius = pr(ctx, P_BOUND_RADIUS);
+        if radius > 0.0 {
+            d.max(length(p) - radius)
+        } else {
+            d
+        }
+    }
+
+    /// The estimate of `family` at object point `q` behind the spherical inversion
+    /// pre-transform (`P_INVERT_*`, `fractal_core::inversion`): the formula and its own ball
+    /// are evaluated at the transformed point, and the distance is divided by the map's
+    /// largest local stretch (the first-order correction derived there).
+    ///
+    /// Out of line, and taken only at a nonzero strength: the inverted route keeps one shared
+    /// copy of the eight estimates, and the uninverted route's code stays exactly the former
+    /// (measured: routing it through a shared wrapper changed its inlining and float
+    /// contractions, and so the bits of every Mandelbulb render).
+    #[inline(never)]
+    fn inverted_estimate(ctx: Context<'_>, q: V3, family: u32, trap_mode: u32) -> (f32, f32) {
+        let (p, stretch) = fractal_core::inversion::apply(
+            q,
+            pv3(ctx, P_INVERT_CENTER),
+            pr(ctx, P_INVERT_RADIUS),
+            pr(ctx, P_INVERT_STRENGTH),
+        );
+        let (d, trap) = family_distance(ctx, family, p, trap_mode);
+        (formula_bound(ctx, p, d) / stretch, trap)
+    }
+
+    /// The object-space estimate `d` at object point `q` (scene point `x`) clipped by the
+    /// object's sphere, then scaled to the scene (or world) and intersected with the masks.
+    #[inline(always)]
+    fn clipped_distance_and_trap(
         ctx: Context<'_>,
         x: V3,
         q: V3,
@@ -856,12 +1007,6 @@ pub mod kernels {
         trap: f32,
         world_clip: bool,
     ) -> (f32, f32) {
-        let radius = pr(ctx, P_BOUND_RADIUS);
-        let d = if radius > 0.0 {
-            d.max(length(q) - radius)
-        } else {
-            d
-        };
         // Marching and every normal stencil must sample the same clipped field.
         let d = if world_clip {
             d.max(length(q) - ctx.objects[ctx.object * OBJECT_STRIDE + O_CLIP_RADIUS])
@@ -881,10 +1026,40 @@ pub mod kernels {
         (d, trap)
     }
 
+    #[inline(always)]
+    fn bounded_distance_and_trap(
+        ctx: Context<'_>,
+        x: V3,
+        q: V3,
+        d: f32,
+        trap: f32,
+        world_clip: bool,
+    ) -> (f32, f32) {
+        clipped_distance_and_trap(ctx, x, q, formula_bound(ctx, q, d), trap, world_clip)
+    }
+
+    /// The scene estimate of family `family` at scene point `x`, through the inversion when its
+    /// strength is nonzero.
+    #[inline(always)]
+    fn inverted_scene_estimate(
+        ctx: Context<'_>,
+        x: V3,
+        family: u32,
+        trap_mode: u32,
+        world_clip: bool,
+    ) -> (f32, f32) {
+        let q = object_point(ctx, x);
+        let (d, trap) = inverted_estimate(ctx, q, family, trap_mode);
+        clipped_distance_and_trap(ctx, x, q, d, trap, world_clip)
+    }
+
     /// Share transformed Mandelbulb arithmetic across the runtime and specialized routes.
     /// Inlined: the hot march pays no call; `inverse_affine` alone keeps a call boundary.
     #[inline(always)]
     fn bulb_estimate(ctx: Context<'_>, x: V3, trap_mode: u32, world_clip: bool) -> (f32, f32) {
+        if pr(ctx, P_INVERT_STRENGTH) != 0.0 {
+            return inverted_scene_estimate(ctx, x, FAMILY_BULB, trap_mode, world_clip);
+        }
         let q = object_point(ctx, x);
         let (d, trap) = bulb_distance(ctx, q, trap_mode);
         bounded_distance_and_trap(ctx, x, q, d, trap, world_clip)
@@ -903,6 +1078,9 @@ pub mod kernels {
             F
         };
         let world_clip = F == FAMILY_WORLD || ctx.world;
+        if pr(ctx, P_INVERT_STRENGTH) != 0.0 {
+            return inverted_scene_estimate(ctx, x, family, trap_mode, world_clip);
+        }
         if family == FAMILY_BULB {
             return bulb_estimate(ctx, x, trap_mode, world_clip);
         }

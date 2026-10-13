@@ -33,7 +33,11 @@ slots! {
     P_CLIP_CENTER = 3, P_CLIP_RADIUS = 1,
     // integrator
     P_MAX_BOUNCES = 1, P_MATERIAL_MODEL = 1,
-    // formula: common
+    // formula: common. P_ITERATIONS may be fractional: every estimate blends its distance and
+    // trap after floor(n) and floor(n) + 1 iterations by the fraction (an integer runs exactly
+    // n). P_JULIA is the Julia mix t of the Mandelbulb / Mandelbox orbit constant,
+    // c = mix(p, P_JULIA_C, t) + P_ORBIT_OFFSET: 0 the Mandelbrot form, 1 the Julia form (a
+    // host with a Julia switch writes 0 / 1).
     P_FAMILY = 1, P_ITERATIONS = 1, P_BAILOUT = 1, P_JULIA = 1, P_JULIA_C = 3,
     P_ITER_ROTATE = 1, P_ITER_ROT = 9,
     P_OBJ_OFFSET = 3, P_OBJ_AXES = 9, P_OBJ_SCALE = 1, P_BOUND_RADIUS = 1,
@@ -102,6 +106,12 @@ slots! {
     P_TRANSMISSION_EXTRA_ROUGHNESS = 1, P_TRANSMISSION_DEPTH = 1,
     // Adaptive sampling (`adapt` kernel): relative error threshold and minimum samples per pixel.
     P_ADAPT_THRESHOLD = 1, P_ADAPT_MIN = 1,
+    // Offset k added to the Mandelbulb / Mandelbox orbit constant every iteration (see P_JULIA);
+    // it does not change dc/dp. Zero: the former constant, bit for bit.
+    P_ORBIT_OFFSET = 3,
+    // Spherical inversion pre-transform of the object point (`crate::inversion`): strength (0
+    // off, 1 the full inversion), centre and radius. Strength 0 is the former estimate.
+    P_INVERT_STRENGTH = 1, P_INVERT_CENTER = 3, P_INVERT_RADIUS = 1,
 }
 
 /// Formula families (ofx-fractal Formula3d codes).
@@ -116,8 +126,9 @@ pub const FAMILY_HYBRID: u32 = 7;
 pub const FAMILY_WORLD: u32 = 8;
 
 /// Each object starts with the existing parameter layout, then a row-major inverse affine.
-/// Version 4: scene masks per object (`O_MASK_COUNT`, `O_MASKS`).
-pub const WORLD_ABI_VERSION: u32 = 4;
+/// Version 4: scene masks per object (`O_MASK_COUNT`, `O_MASKS`). Version 5: the parameter
+/// layout gained the orbit offset and the inversion slots, so every object row is longer.
+pub const WORLD_ABI_VERSION: u32 = 5;
 pub const O_INVERSE: usize = P_COUNT;
 pub const O_DISTANCE_SCALE: usize = O_INVERSE + 12;
 pub const O_CLIP_RADIUS: usize = O_DISTANCE_SCALE + 1;
