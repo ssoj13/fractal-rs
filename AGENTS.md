@@ -16,6 +16,16 @@ map: `C:\projects\projects.rust.cg\nv\prs\kernels-divergence.md`).
 | `fractal-kernels` | `#[cuda_module] kernels` (cuda-host flavour: typed loader `kernels::load`), `direct` feature | WarpBro links it; OFX regenerates embedded PTX/cubin from it |
 | `fractal-materials` | material presets (append-only: hosts store indices) | WarpBro `materials.rs`, OFX `materials.rs` |
 
+## Kernel float bits follow the code layout (measured 2026-10-13)
+
+NVPTX fuses multiply-adds per basic block, so a branch or wrapper around the distance estimates
+changes rounding without changing the arithmetic. Branch `mandelbulb-params` (ABI 5: Julia mix in
+`P_JULIA`, fractional `P_ITERATIONS`, `P_ORBIT_OFFSET`, `P_INVERT_*`): a closure wrapper around the
+estimates changed every Mandelbulb render by ULPs; the inversion as an out-of-line route
+(`inverted_estimate`, one check atop `signed_distance_and_trap`) keeps 34 of 36 WarpBro gallery
+routes bit-identical, world Hybrid within ULPs (normals 2.6e-4). Not a regression; never chase
+layout tricks for bits.
+
 ## Build facts (verified)
 
 - Kernels in a dependency crate work: WarpBro's `cargo oxide build` compiles `fractal-kernels` and
