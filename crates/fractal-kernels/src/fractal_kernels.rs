@@ -219,6 +219,9 @@ pub mod kernels {
     /// before the extra one ([`fraction_due`] / [`fraction_save`]) and blends them with the
     /// final pair by frac ([`fraction_blend`]). The result is continuous in n, both lerped
     /// fields are the same family's estimates; an integer n runs exactly the former loop.
+    /// One exception at the integers: where the n-iteration estimate is 0 (inside) its gradient
+    /// is 0, so a normal stencil wholly inside it takes the (n+1)-th estimate's gradient at any
+    /// fraction above 0 (measured in WarpBro: ~2% of a bulb's hit pixels, the rest continuous).
     #[derive(Clone, Copy)]
     struct Fraction {
         run: u32,
