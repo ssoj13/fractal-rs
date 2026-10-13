@@ -3537,6 +3537,56 @@ pub mod kernels {
         }
     }
 
+    /// Viewport picking: the world's camera ray through each query point (`[x, y, _, _]` in
+    /// normalized device coordinates, -1..1, y up), without a lens, marched as a camera sample's
+    /// first ray (the same estimators, transforms and masks, [`cone_start`]). `out` gets
+    /// `[object + 1 (0: nothing hit), distance along the ray, depth along the view axis, 0]`.
+    /// Reads the `PARAMS` the world launch uploads: the host sets them first.
+    #[kernel]
+    #[launch_contract(domain = 1, block = (32, 1, 1))]
+    pub fn pick(
+        objects: &[f32],
+        lights: &[f32],
+        query: &[[f32; 4]],
+        mut out: DisjointSlice<[f32; 4]>,
+    ) {
+        let idx = thread::index_1d();
+        let i = idx.get();
+        if let (Some(q), Some(o)) = (query.get(i), out.get_mut(idx)) {
+            let ctx = Context {
+                world: true,
+                objects,
+                lights,
+                object: 0,
+            };
+            let origin = pv3(ctx, P_CAM_ORIGIN);
+            let fwd = pv3(ctx, P_CAM_FORWARD);
+            let dir = normalize(add(
+                fwd,
+                add(
+                    mul(pv3(ctx, P_CAM_RIGHT), q[0] * pr(ctx, P_HALF_W)),
+                    mul(pv3(ctx, P_CAM_UP), q[1] * pr(ctx, P_HALF_H)),
+                ),
+            ));
+            let start = cone_start::<FAMILY_WORLD>(ctx, origin, dir);
+            let m = march::<FAMILY_WORLD>(
+                ctx,
+                origin,
+                dir,
+                RAY_PRIMARY,
+                0.0,
+                pr(ctx, P_FOOTPRINT),
+                start,
+            );
+            *o = if m.hit() {
+                let t = length(sub(m.point, origin));
+                [(m.object + 1) as f32, t, t * dot(dir, fwd), 0.0]
+            } else {
+                [0.0; 4]
+            };
+        }
+    }
+
     // Uniform-model worlds omit the unused BSDF at compile time, reducing register
     // pressure without bypassing world transforms, clipping, materials or lights.
     #[kernel]
