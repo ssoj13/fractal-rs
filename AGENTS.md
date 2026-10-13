@@ -28,6 +28,15 @@ layout tricks for bits.
 
 ## Build facts (verified)
 
+- MIS rounding is explicit in `power_heuristic`: `a.mul_add(a, b * b)` fixes the FMA arm.
+  The former `a*a + b*b` compiled differently in homogeneous Fast and mixed worlds;
+  identical PDFs produced denominators 168370976 and 168370992 at pixel (19,13), sample 2,
+  seed 17, leaving a one-ULP green-channel difference after 8 spp. Changing only that FMA
+  in PTX made the strict oracle pass. The Rust fix builds for sm_75 and passes WarpBro's
+  full suite: 315 passed, 0 failed, 13 ignored. The material oracle is no longer ignored.
+  Use the standard `mul_add`: the current generated cuda-device scalar intrinsics impose
+  an unrelated sm_80 floor, under separate upstream investigation. No tolerance was loosened.
+
 - Kernels in a dependency crate work: WarpBro's `cargo oxide build` compiles `fractal-kernels` and
   writes `target/oxide-ptx/fractal_kernels.ptx`; `#[cuda_module]` expands in the library and needs
   `cuda-core` as its direct dependency (the loader names its types).

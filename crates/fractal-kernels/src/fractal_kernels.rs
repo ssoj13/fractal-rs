@@ -2527,8 +2527,15 @@ pub mod kernels {
 
     #[inline(always)]
     fn power_heuristic(a: f32, b: f32) -> f32 {
-        let (a2, b2) = (a * a, b * b);
-        if a2 + b2 > 0.0 { a2 / (a2 + b2) } else { 0.0 }
+        // Fix the contraction arm: homogeneous and mixed material routes otherwise choose
+        // different FMAs for a*a + b*b and can disagree by one ULP at identical PDFs.
+        let a2 = a * a;
+        let denominator = a.mul_add(a, b * b);
+        if denominator > 0.0 {
+            a2 / denominator
+        } else {
+            0.0
+        }
     }
 
     // =========================================================================
