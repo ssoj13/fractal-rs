@@ -981,9 +981,7 @@ pub mod kernels {
     /// largest local stretch (the first-order correction derived there).
     ///
     /// Out of line, and taken only at a nonzero strength: the inverted route keeps one shared
-    /// copy of the eight estimates, and the uninverted route's code stays exactly the former
-    /// (measured: routing it through a shared wrapper changed its inlining and float
-    /// contractions, and so the bits of every Mandelbulb render).
+    /// copy of the eight estimates, and the uninverted route's code stays the former.
     #[inline(never)]
     fn inverted_estimate(ctx: Context<'_>, q: V3, family: u32, trap_mode: u32) -> (f32, f32) {
         let (p, stretch) = fractal_core::inversion::apply(
@@ -1057,15 +1055,20 @@ pub mod kernels {
     /// Inlined: the hot march pays no call; `inverse_affine` alone keeps a call boundary.
     #[inline(always)]
     fn bulb_estimate(ctx: Context<'_>, x: V3, trap_mode: u32, world_clip: bool) -> (f32, f32) {
-        if pr(ctx, P_INVERT_STRENGTH) != 0.0 {
-            return inverted_scene_estimate(ctx, x, FAMILY_BULB, trap_mode, world_clip);
-        }
         let q = object_point(ctx, x);
         let (d, trap) = bulb_distance(ctx, q, trap_mode);
         bounded_distance_and_trap(ctx, x, q, d, trap, world_clip)
     }
 
     /// Signed transformed estimate and trap (fractal3d.wgsl signed_distance_and_trap).
+    ///
+    /// Float bits here depend on the code layout, not only on the arithmetic: NVPTX fuses a
+    /// multiply and an add into an FMA within a basic block, so a branch or a wrapper added
+    /// around the estimates moves those fusions. Measured (WarpBro A/B of every gallery scene
+    /// against the kernels before the inversion and fractional-iteration change): routing the
+    /// estimates through a shared closure changed every Mandelbulb render by ULPs; the current
+    /// layout keeps every family bit-identical except Hybrid on the world route (normals within
+    /// ~1e-4, paths then diverge). Same arithmetic, different rounding: not a regression.
     #[inline(always)]
     fn signed_distance_and_trap<const F: u32>(
         ctx: Context<'_>,
@@ -1078,12 +1081,11 @@ pub mod kernels {
             F
         };
         let world_clip = F == FAMILY_WORLD || ctx.world;
+        if pr(ctx, P_INVERT_STRENGTH) != 0.0 {
+            return inverted_scene_estimate(ctx, x, family, trap_mode, world_clip);
+        }
         if family == FAMILY_BULB {
             return bulb_estimate(ctx, x, trap_mode, world_clip);
-        }
-        // The world route checks the inversion before its dispatch (`world_estimate`).
-        if F != FAMILY_WORLD && pr(ctx, P_INVERT_STRENGTH) != 0.0 {
-            return inverted_scene_estimate(ctx, x, family, trap_mode, world_clip);
         }
         let q = object_point(ctx, x);
         let (d, trap) = match family {
@@ -1112,9 +1114,6 @@ pub mod kernels {
     // primary/shadow marches and four normal stencils makes cold driver JIT very costly.
     #[inline(never)]
     fn world_estimate(ctx: Context<'_>, x: V3, trap_mode: u32) -> (f32, f32) {
-        if pr(ctx, P_INVERT_STRENGTH) != 0.0 {
-            return inverted_scene_estimate(ctx, x, pr(ctx, P_FAMILY) as u32, trap_mode, true);
-        }
         signed_distance_and_trap::<FAMILY_WORLD>(ctx, x, trap_mode)
     }
 
