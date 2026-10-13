@@ -1078,11 +1078,12 @@ pub mod kernels {
             F
         };
         let world_clip = F == FAMILY_WORLD || ctx.world;
-        if pr(ctx, P_INVERT_STRENGTH) != 0.0 {
-            return inverted_scene_estimate(ctx, x, family, trap_mode, world_clip);
-        }
         if family == FAMILY_BULB {
             return bulb_estimate(ctx, x, trap_mode, world_clip);
+        }
+        // The world route checks the inversion before its dispatch (`world_estimate`).
+        if F != FAMILY_WORLD && pr(ctx, P_INVERT_STRENGTH) != 0.0 {
+            return inverted_scene_estimate(ctx, x, family, trap_mode, world_clip);
         }
         let q = object_point(ctx, x);
         let (d, trap) = match family {
@@ -1111,6 +1112,9 @@ pub mod kernels {
     // primary/shadow marches and four normal stencils makes cold driver JIT very costly.
     #[inline(never)]
     fn world_estimate(ctx: Context<'_>, x: V3, trap_mode: u32) -> (f32, f32) {
+        if pr(ctx, P_INVERT_STRENGTH) != 0.0 {
+            return inverted_scene_estimate(ctx, x, pr(ctx, P_FAMILY) as u32, trap_mode, true);
+        }
         signed_distance_and_trap::<FAMILY_WORLD>(ctx, x, trap_mode)
     }
 

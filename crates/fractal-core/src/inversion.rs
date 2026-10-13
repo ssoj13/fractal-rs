@@ -26,7 +26,11 @@ pub fn apply(p: [f32; 3], centre: [f32; 3], radius: f32, strength: f32) -> ([f32
     let r2 = (u[0] * u[0] + u[1] * u[1] + u[2] * u[2]).max(1.0e-30);
     let g = (1.0 - strength) + strength * radius * radius / r2;
     (
-        [centre[0] + g * u[0], centre[1] + g * u[1], centre[2] + g * u[2]],
+        [
+            centre[0] + g * u[0],
+            centre[1] + g * u[1],
+            centre[2] + g * u[2],
+        ],
         g,
     )
 }
@@ -45,7 +49,9 @@ pub fn reach(centre: [f32; 3], radius: f32, strength: f32, ball: f32) -> Option<
     if strength == 0.0 {
         return Some(ball);
     }
-    let d = f64::from(centre[0]).hypot(f64::from(centre[1])).hypot(f64::from(centre[2]));
+    let d = f64::from(centre[0])
+        .hypot(f64::from(centre[1]))
+        .hypot(f64::from(centre[2]));
     let (s, rho2, ball) = (
         f64::from(strength),
         f64::from(radius) * f64::from(radius),
@@ -130,7 +136,10 @@ mod tests {
                     let p = [c[0] + dir[0] * r, c[1] + dir[1] * r, c[2] + dir[2] * r];
                     if length(apply(p, c, rho, s).0) <= ball {
                         inside += 1;
-                        assert!(length(p) <= bound * 1.0001, "{c:?} {rho} {s}: {p:?} > {bound}");
+                        assert!(
+                            length(p) <= bound * 1.0001,
+                            "{c:?} {rho} {s}: {p:?} > {bound}"
+                        );
                     }
                 }
             }
