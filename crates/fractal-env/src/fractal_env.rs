@@ -50,7 +50,10 @@ pub fn default_path() -> String {
 /// for an unknown name.
 pub fn builtin(path: &str) -> Option<&'static [u8]> {
     let name = path.strip_prefix(BUILTIN_PREFIX)?;
-    BUILTINS.iter().find(|(n, _)| *n == name).map(|(_, bytes)| *bytes)
+    BUILTINS
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, bytes)| *bytes)
 }
 
 /// Range of the probability of sampling the sun cone rather than the sky: neither strategy is
