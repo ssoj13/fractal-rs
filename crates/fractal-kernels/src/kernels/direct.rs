@@ -1,6 +1,7 @@
 //! Optional deterministic Direct shading (OFX's Direct mode, the twin of its CPU and WGSL
 //! `fractal3d::shade`): one primary march, the key light with a soft shadow, five-probe AO and the
-//! sky or HDRI through its harmonics and mips. WarpBro's path tracer does not use it.
+//! sky or HDRI through its harmonics and mips. OFX shades one object (`direct_<family>`); WarpBro
+//! shades its world (`world_direct`: the hit object's material, every directional light).
 //! Keeping this module behind the `direct` feature excludes its BSDF and eight entry points
 //! from normal device compilation, rather than merely skipping their dispatch.
 
@@ -43,8 +44,9 @@ fn direct_cross(a: V3, b: V3) -> V3 {
         a[0] * b[1] - a[1] * b[0],
     ]
 }
+/// Soft shadow toward a light of angular radius `angle` (radians; 0 = a hard point-light edge).
 #[inline(always)]
-fn direct_shadow<const F: u32>(ctx: Context<'_>, p: V3, n: V3, l: V3, eps: f32) -> f32 {
+fn direct_shadow<const F: u32>(ctx: Context<'_>, p: V3, n: V3, l: V3, eps: f32, angle: f32) -> f32 {
     let strength = global(P_SHADOW_STRENGTH);
     let steps = global(P_SHADOW_STEPS) as u32;
     if strength == 0.0 || steps == 0 {
@@ -54,7 +56,6 @@ fn direct_shadow<const F: u32>(ctx: Context<'_>, p: V3, n: V3, l: V3, eps: f32) 
     let mut t = 4.0 * eps;
     let origin = add(p, mul(n, t));
     let cap = 2.0 * max_distance / steps as f32;
-    let angle = global(P_LIGHT_HALF_ANGLE);
     let sharpness = if angle > 0.0 { 1.0 / angle.tan() } else { 0.0 };
     let mut visibility = 1.0f32;
     let mut i = 0;
@@ -108,6 +109,50 @@ fn direct_ao<const F: u32>(ctx: Context<'_>, p: V3, n: V3) -> f32 {
     }
     (1.0 - strength * sum / (steps * 5) as f32).max(0.0)
 }
+/// The key light of Direct at `p`: one disc light's shading times its soft shadow. A single
+/// object (OFX) has the root light with its `P_LIGHT_HALF_ANGLE`; a world sums its directional
+/// lights (`ctx.lights`, `P_LIGHT_COUNT`), each with the angular radius of its cone
+/// (`P_SUN_ONE_MINUS_COS`) and its own shadow.
+#[inline(always)]
+fn direct_key<const F: u32>(
+    ctx: Context<'_>,
+    inputs: &SurfaceInputs,
+    frame: &ShadingFrame,
+    view: V3,
+    p: V3,
+    n: V3,
+    eps: f32,
+) -> V3 {
+    if !ctx.world {
+        let l = pv3(ctx, P_LIGHT_DIR);
+        let angle = global(P_LIGHT_HALF_ANGLE);
+        let sun = eval_light_disc(inputs, frame, view, l, angle).sum();
+        let visibility = direct_shadow::<F>(ctx, p, n, l, eps, angle);
+        return mul(
+            had(pv3(ctx, P_LIGHT_COLOR), sun),
+            global(P_LIGHT_INTENSITY) * visibility,
+        );
+    }
+    let mut key = [0.0; 3];
+    let mut i = 0usize;
+    while i < global(P_LIGHT_COUNT) as usize {
+        let l = light_v3(ctx, i, P_LIGHT_DIR);
+        let angle = (1.0 - light_slot(ctx, i, P_SUN_ONE_MINUS_COS))
+            .clamp(-1.0, 1.0)
+            .acos();
+        let sun = eval_light_disc(inputs, frame, view, l, angle).sum();
+        let visibility = direct_shadow::<F>(ctx, p, n, l, eps, angle);
+        key = add(
+            key,
+            mul(
+                had(light_v3(ctx, i, P_LIGHT_COLOR), sun),
+                light_slot(ctx, i, P_LIGHT_INTENSITY) * visibility,
+            ),
+        );
+        i += 1;
+    }
+    key
+}
 #[inline(always)]
 fn direct_roughness(r: f32, v: f32) -> f32 {
     if v == 0.0 {
@@ -140,6 +185,11 @@ pub(super) fn trace_direct<const F: u32>(
             unresolved,
         };
     }
+    // A world shades with the hit object's block (material, colour, tangent), as `trace_path`.
+    let ctx = Context {
+        object: m.object,
+        ..ctx
+    };
     let center = if family_signed::<F>(ctx) {
         m.point
     } else {
@@ -163,30 +213,28 @@ pub(super) fn trace_direct<const F: u32>(
     let facing = if dot(n, view) > 0.0 { n } else { neg(n) };
     let frame = ShadingFrame {
         n: facing,
-        tangent: mat3(ctx, P_OBJ_AXES, [0.0, 1.0, 0.0]),
+        tangent: object_up::<F>(ctx),
         inside: false,
         curvature: 0.0,
     };
-    let mut color = if global(P_COLOR_SOURCE) != 0.0 {
+    // Material slots through `pr`: the hit object's in a world, the root block otherwise.
+    let mut color = if pr(ctx, P_COLOR_SOURCE) != 0.0 {
         pv3(ctx, P_BASE_COLOR)
     } else {
         hit_palette(ctx, lut, m.point, n, m.trap)
     };
-    let mut roughness = global(P_SPECULAR_ROUGHNESS);
-    let mut metal = global(P_METALNESS);
-    let exponent = global(P_FACING_EXPONENT);
+    let mut roughness = pr(ctx, P_SPECULAR_ROUGHNESS);
+    let mut metal = pr(ctx, P_METALNESS);
+    let exponent = pr(ctx, P_FACING_EXPONENT);
     if exponent > 0.0 {
         let f = (1.0 - dot(facing, view).abs()).max(0.0).powf(exponent);
         color = add(color, mul(sub(pv3(ctx, P_FACING_COLOR), color), f));
-        roughness += (global(P_FACING_ROUGHNESS) - roughness) * f;
-        metal += (global(P_FACING_METALLIC) - metal) * f;
+        roughness += (pr(ctx, P_FACING_ROUGHNESS) - roughness) * f;
+        metal += (pr(ctx, P_FACING_METALLIC) - metal) * f;
     }
     let mut inputs = surface_inputs(ctx, color, roughness, metal);
     inputs.specular_roughness = direct_roughness(inputs.specular_roughness, variance);
     inputs.coat_roughness = direct_roughness(inputs.coat_roughness, variance);
-    let l = pv3(ctx, P_LIGHT_DIR);
-    let sun = eval_light_disc(&inputs, &frame, view, l, global(P_LIGHT_HALF_ANGLE)).sum();
-    let visibility = direct_shadow::<F>(ctx, m.point, n, l, m.eps);
     let ao = direct_ao::<F>(ctx, m.point, n);
     let specular_alpha = mx_average_alpha(main_alpha(&inputs));
     let coat_lobe_alpha = mx_average_alpha(coat_alpha(&inputs));
@@ -202,10 +250,7 @@ pub(super) fn trace_direct<const F: u32>(
     };
     let reflected = eval_environment(&inputs, &frame, view, &environment).sum();
     let emitted = eval_emission(&inputs, &frame, view);
-    let key = mul(
-        had(pv3(ctx, P_LIGHT_COLOR), sun),
-        global(P_LIGHT_INTENSITY) * visibility,
-    );
+    let key = direct_key::<F>(ctx, &inputs, &frame, view, m.point, n, m.eps);
     PathSample {
         radiance: add(add(key, reflected), emitted),
         hit: true,

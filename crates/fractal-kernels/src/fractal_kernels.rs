@@ -120,6 +120,18 @@ pub mod kernels {
     fn pv3(ctx: Context<'_>, i: usize) -> V3 {
         [pr(ctx, i), pr(ctx, i + 1), pr(ctx, i + 2)]
     }
+    /// The shading tangent of the context's object (its local +Y in world space): a world
+    /// object's packed `O_TANGENT`, else the single object's axes. The path tracer and Direct
+    /// shade with it.
+    #[inline(always)]
+    fn object_up<const F: u32>(ctx: Context<'_>) -> V3 {
+        if F == FAMILY_WORLD || ctx.world {
+            let b = ctx.object * OBJECT_STRIDE + O_TANGENT;
+            [ctx.objects[b], ctx.objects[b + 1], ctx.objects[b + 2]]
+        } else {
+            mat3(ctx, P_OBJ_AXES, [0.0, 1.0, 0.0])
+        }
+    }
     /// Row-major 3x3 at slot `i` times `v`.
     #[inline(always)]
     fn mat3(ctx: Context<'_>, i: usize, v: V3) -> V3 {
@@ -2968,12 +2980,7 @@ pub mod kernels {
             } else {
                 FULL
             };
-            let up = if F == FAMILY_WORLD || ctx.world {
-                let b = ctx.object * OBJECT_STRIDE + O_TANGENT;
-                [ctx.objects[b], ctx.objects[b + 1], ctx.objects[b + 2]]
-            } else {
-                mat3(ctx, P_OBJ_AXES, [0.0, 1.0, 0.0])
-            };
+            let up = object_up::<F>(ctx);
             if inside {
                 throughput = had(
                     throughput,
@@ -4063,6 +4070,51 @@ pub mod kernels {
             stats.get_mut(thread::index_1d()),
         ) {
             trace_pixel::<false, FAMILY_WORLD, true, false>(
+                Context {
+                    world: true,
+                    objects,
+                    lights,
+                    object: 0,
+                    normal_iterations: None,
+                },
+                lut,
+                i,
+                active,
+                PixelOut {
+                    acc,
+                    albedo,
+                    normal,
+                    stats,
+                },
+            );
+        }
+    }
+
+    /// Deterministic Direct shading of a world (`kernels/direct.rs`): `world`'s launch with
+    /// `trace_direct` per stratum of the `P_DIRECT_GRID` square instead of a path.
+    #[cfg(feature = "direct")]
+    #[kernel]
+    #[launch_bounds(128)]
+    #[launch_contract(domain = 1, block = (128, 1, 1))]
+    pub fn world_direct(
+        lut: &[[f32; 4]],
+        objects: &[f32],
+        lights: &[f32],
+        mut accum: DisjointSlice<[f32; 4]>,
+        mut albedo: DisjointSlice<[f32; 4]>,
+        mut normal: DisjointSlice<[f32; 4]>,
+        active: &[u32],
+        mut stats: DisjointSlice<[f32; 4]>,
+    ) {
+        let idx = thread::index_1d();
+        let i = idx.get() as u32;
+        if let (Some(acc), Some(albedo), Some(normal), Some(stats)) = (
+            accum.get_mut(idx),
+            albedo.get_mut(thread::index_1d()),
+            normal.get_mut(thread::index_1d()),
+            stats.get_mut(thread::index_1d()),
+        ) {
+            trace_pixel::<false, FAMILY_WORLD, true, true>(
                 Context {
                     world: true,
                     objects,
