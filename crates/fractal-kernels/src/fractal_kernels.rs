@@ -1352,6 +1352,101 @@ pub mod kernels {
         false
     }
 
+    #[inline(always)]
+    fn bulb_distance_endpoints(ctx: Context<'_>, q: V3, run: u32) -> (f32, f32) {
+        let bailout = pr(ctx, P_BAILOUT);
+        let (c, dr_constant) = orbit_constant(ctx, q);
+        let estimate = |r: f32, dr: f32| {
+            if r <= bailout || dr <= 0.0 {
+                0.0
+            } else {
+                0.5 * r.ln() * r / dr
+            }
+        };
+        let mut z = q;
+        let mut dr = 1.0f32;
+        let mut r = length(z);
+        let mut saved = None;
+        let mut i = 0u32;
+        while i < run {
+            if i + 1 == run {
+                saved = Some(estimate(r, dr));
+            }
+            if r > bailout {
+                break;
+            }
+            if r < 1.0e-8 {
+                return (0.0, 0.0);
+            }
+            if !bulb_step(ctx, &mut z, &mut dr, r, c, dr_constant) {
+                break;
+            }
+            r = length(z);
+            i += 1;
+        }
+        let upper = estimate(r, dr);
+        (saved.unwrap_or(upper), upper)
+    }
+
+    #[inline(always)]
+    fn fractional_bulb_endpoints(
+        ctx: Context<'_>,
+        x: V3,
+        run: u32,
+        frac: f32,
+        world_clip: bool,
+    ) -> (f32, f32, f32) {
+        let q = object_point(ctx, x);
+        if pr(ctx, P_INVERT_STRENGTH) != 0.0 {
+            let (p, stretch) = fractal_core::inversion::apply(
+                q,
+                pv3(ctx, P_INVERT_CENTER),
+                pr(ctx, P_INVERT_RADIUS),
+                pr(ctx, P_INVERT_STRENGTH),
+            );
+            let (low, high) = bulb_distance_endpoints(ctx, p, run);
+            let blend = low + (high - low) * frac;
+            let a = clipped_distance_and_trap(
+                ctx,
+                x,
+                q,
+                formula_bound(ctx, p, low) / stretch,
+                0.0,
+                world_clip,
+            )
+            .0;
+            let b = clipped_distance_and_trap(
+                ctx,
+                x,
+                q,
+                formula_bound(ctx, p, high) / stretch,
+                0.0,
+                world_clip,
+            )
+            .0;
+            let w = clipped_distance_and_trap(
+                ctx,
+                x,
+                q,
+                formula_bound(ctx, p, blend) / stretch,
+                0.0,
+                world_clip,
+            )
+            .0
+            .max(0.0);
+            (a, b, w)
+        } else {
+            let (low, high) = bulb_distance_endpoints(ctx, q, run);
+            let blend = low + (high - low) * frac;
+            let a = bounded_distance_and_trap(ctx, x, q, low, 0.0, world_clip).0;
+            let b = bounded_distance_and_trap(ctx, x, q, high, 0.0, world_clip).0;
+            let w = bounded_distance_and_trap(ctx, x, q, blend, 0.0, world_clip)
+                .0
+                .max(0.0);
+            (a, b, w)
+        }
+    }
+
     // A weighted hit requires each nonnegative endpoint's contribution to be
     // no greater than eps. Under the tracer's distance-estimate assumption,
     // (weight * distance - eps) / (weight * ray_speed + epsilon_slope) bounds advance to
@@ -1373,37 +1468,31 @@ pub mod kernels {
         } else {
             1
         };
+        let world_clip = F == FAMILY_WORLD || ctx.world;
         let mut object = 0usize;
         while object < count {
             let c = Context { object, ..ctx };
+            if F == FAMILY_WORLD && object != nearest {
+                let row = object * OBJECT_STRIDE;
+                let reach = (length(object_point(c, x)) - ctx.objects[row + O_CLIP_RADIUS])
+                    * ctx.objects[row + O_DISTANCE_SCALE];
+                if reach >= best {
+                    object += 1;
+                    continue;
+                }
+            }
             let family = if F == FAMILY_WORLD {
                 pr(c, P_FAMILY) as u32
             } else {
                 F
             };
-            let weighted = if object == nearest {
-                weighted_distance
-            } else {
-                world_estimate(c, x, 0).0.max(0.0)
-            };
             let distance = if fractional_bulb(c, family) {
                 let f = fraction(c);
-                let whole = f.run - 1;
-                let lower = Context {
-                    normal_iterations: Some((object, whole)),
-                    ..c
-                };
-                let upper = Context {
-                    normal_iterations: Some((object, whole + 1)),
-                    ..c
-                };
-                let (a, b) = if F == FAMILY_WORLD {
-                    (world_estimate(lower, x, 0).0, world_estimate(upper, x, 0).0)
+                let (a, b, w) = fractional_bulb_endpoints(c, x, f.run, f.frac, world_clip);
+                let weighted = if object == nearest {
+                    weighted_distance
                 } else {
-                    (
-                        signed_distance_and_trap::<F>(lower, x, 0).0,
-                        signed_distance_and_trap::<F>(upper, x, 0).0,
-                    )
+                    w
                 };
                 if a >= 0.0 && a <= f32::MAX && b >= 0.0 && b <= f32::MAX {
                     let lower_weight = 1.0 - f.frac;
@@ -1416,8 +1505,10 @@ pub mod kernels {
                     // An invalid endpoint probe cannot authorize a larger step.
                     weighted
                 }
+            } else if object == nearest {
+                weighted_distance
             } else {
-                weighted
+                world_estimate(c, x, 0).0.max(0.0)
             };
             best = best.min(distance);
             object += 1;
@@ -1427,13 +1518,15 @@ pub mod kernels {
 
     /// The interval a ray marches over: `(t_enter, max_distance)`, or `None` when it misses the
     /// bounding sphere. Outside the sphere every estimate is an exact "outside" (escape radius /
-    /// ball bound), so marching there only burns steps; Direct previews and OFX renders that
+    /// ball bound), so marching there only burns steps; OFX Direct previews and OFX renders that
     /// disable clipping march `[0, P_MAX_DISTANCE]`. Shared by [`march`] and
     /// [`march_visibility`].
     #[inline(always)]
     fn march_span(ctx: Context<'_>, origin: V3, dir: V3) -> Option<(f32, f32)> {
         let max_distance = pr(ctx, P_MAX_DISTANCE);
-        if global(P_DIRECT) != 0.0 || (global(P_OFX) != 0.0 && global(P_OFX_NO_CLIP) != 0.0) {
+        if (!ctx.world && global(P_DIRECT) != 0.0)
+            || (global(P_OFX) != 0.0 && global(P_OFX_NO_CLIP) != 0.0)
+        {
             return Some((0.0, max_distance));
         }
         let oc = sub(origin, pv3(ctx, P_CLIP_CENTER));
@@ -2504,28 +2597,32 @@ pub mod kernels {
         sky_radiance(ctx, dir)
     }
 
-    /// pathtrace.rs SunSky::pdf: the sun-cone and sky mixture density.
     #[inline(always)]
-    fn env_pdf(ctx: Context<'_>, lut: &[[f32; 4]], dir: V3) -> f32 {
-        if ctx.world {
-            let total = world_light_total(ctx);
-            let mut pdf = world_sky_weight(ctx) / total
-                * if env_on(ctx) {
-                    env_map_pdf(ctx, lut, dir)
-                } else {
-                    0.079_577_47
-                };
-            let mut i = 0usize;
-            while i < global(P_LIGHT_COUNT) as usize {
-                if world_sun_contains(ctx, i, dir) {
-                    pdf += world_sun_weight(ctx, i) / total * light_slot(ctx, i, P_SUN_CONE_PDF);
-                }
-                i += 1;
+    fn world_env_pdf(
+        ctx: Context<'_>,
+        lut: &[[f32; 4]],
+        dir: V3,
+        sky_weight: f32,
+        total: f32,
+    ) -> f32 {
+        let mut pdf = sky_weight / total
+            * if env_on(ctx) {
+                env_map_pdf(ctx, lut, dir)
+            } else {
+                0.079_577_47
+            };
+        let mut i = 0usize;
+        while i < global(P_LIGHT_COUNT) as usize {
+            if world_sun_contains(ctx, i, dir) {
+                pdf += world_sun_weight(ctx, i) / total * light_slot(ctx, i, P_SUN_CONE_PDF);
             }
-            return pdf;
+            i += 1;
         }
+        pdf
+    }
 
-        let s = sun_select(ctx);
+    #[inline(always)]
+    fn single_env_pdf(ctx: Context<'_>, lut: &[[f32; 4]], dir: V3, s: f32) -> f32 {
         let mut pdf = (1.0 - s)
             * if env_on(ctx) {
                 env_map_pdf(ctx, lut, dir)
@@ -2536,6 +2633,15 @@ pub mod kernels {
             pdf += s * pr(ctx, P_SUN_CONE_PDF);
         }
         pdf
+    }
+
+    /// pathtrace.rs SunSky::pdf: the sun-cone and sky mixture density.
+    #[inline(always)]
+    fn env_pdf(ctx: Context<'_>, lut: &[[f32; 4]], dir: V3) -> f32 {
+        if ctx.world {
+            return world_env_pdf(ctx, lut, dir, world_sky_weight(ctx), world_light_total(ctx));
+        }
+        single_env_pdf(ctx, lut, dir, sun_select(ctx))
     }
 
     #[inline(always)]
@@ -2554,9 +2660,17 @@ pub mod kernels {
     #[inline(always)]
     fn env_sample(ctx: Context<'_>, lut: &[[f32; 4]], r1: f32, r2: f32) -> (V3, f32) {
         if ctx.world {
-            let mut selector = r1 * world_light_total(ctx);
+            let sky_weight = world_sky_weight(ctx);
+            let mut total = sky_weight;
+            let count = global(P_LIGHT_COUNT) as usize;
+            let mut k = 0usize;
+            while k < count {
+                total += world_sun_weight(ctx, k);
+                k += 1;
+            }
+            let mut selector = r1 * total;
             let mut i = 0usize;
-            while i < global(P_LIGHT_COUNT) as usize {
+            while i < count {
                 let weight = world_sun_weight(ctx, i);
                 if selector < weight {
                     let d = light_v3(ctx, i, P_LIGHT_DIR);
@@ -2565,12 +2679,12 @@ pub mod kernels {
                     let sin_t = (1.0 - cos_t * cos_t).max(0.0).sqrt();
                     let (sp, cp) = sin_cos(2.0 * PI * r2);
                     let dir = add(add(mul(t, sin_t * cp), mul(b, sin_t * sp)), mul(d, cos_t));
-                    return (dir, env_pdf(ctx, lut, dir));
+                    return (dir, world_env_pdf(ctx, lut, dir, sky_weight, total));
                 }
                 selector -= weight;
                 i += 1;
             }
-            let u = (selector / world_sky_weight(ctx)).clamp(0.0, 0.99999994);
+            let u = (selector / sky_weight).clamp(0.0, 0.99999994);
             let dir = if env_on(ctx) {
                 env_map_sample(ctx, lut, u, r2)
             } else {
@@ -2579,7 +2693,7 @@ pub mod kernels {
                 let (sp, cp) = sin_cos(2.0 * PI * r2);
                 [radius * cp, radius * sp, z]
             };
-            return (dir, env_pdf(ctx, lut, dir));
+            return (dir, world_env_pdf(ctx, lut, dir, sky_weight, total));
         }
 
         let s = sun_select(ctx);
@@ -2598,7 +2712,7 @@ pub mod kernels {
             let (sp, cp) = sin_cos(2.0 * PI * r2);
             [r * cp, r * sp, z]
         };
-        (dir, env_pdf(ctx, lut, dir))
+        (dir, single_env_pdf(ctx, lut, dir, s))
     }
 
     #[inline(always)]
@@ -3091,7 +3205,9 @@ pub mod kernels {
             let point_sun = !ctx.world
                 && pr(ctx, P_SUN_CONE_PDF) <= 0.0
                 && !(env_on(ctx) && pr(ctx, P_ENV_SUN_SELECT) == 0.0);
-            let (ld, lpdf) = if point_sun {
+            let (ld, lpdf) = if inside {
+                ([0.0; 3], 0.0)
+            } else if point_sun {
                 (pv3(ctx, P_LIGHT_DIR), 1.0)
             } else {
                 env_sample(ctx, lut, r1, r2)
@@ -3245,7 +3361,7 @@ pub mod kernels {
         // that w is the guide's sample count the denoiser divides by). INVARIANT: an
         // accumulation's launches begin at sample 0 on zeroed stats, as the hosts reset them;
         // a later launch on a fresh buffer reads 0, i.e. no start. A lens ray does not start at
-        // the cone's apex, so depth of field (and Direct) march from `t_enter`.
+        // the cone's apex, so depth of field (and OFX Direct) march from `t_enter`.
         let cx = 2.0 * (x as f32 + 0.5) / width as f32 - 1.0;
         let cy = 1.0 - 2.0 * (y as f32 + 0.5) / height as f32;
         let centre = normalize(add(
@@ -3260,7 +3376,7 @@ pub mod kernels {
         } else {
             Some(centre)
         };
-        let start = if DIRECT || aperture > 0.0 {
+        let start = if (DIRECT && !ctx.world) || aperture > 0.0 {
             0.0
         } else if begin != 0 {
             stats[2]
@@ -3317,7 +3433,7 @@ pub mod kernels {
             }
             #[cfg(feature = "direct")]
             let sample = if DIRECT {
-                direct::trace_direct::<F>(ctx, lut, ro, dir)
+                direct::trace_direct::<F>(ctx, lut, ro, dir, start)
             } else {
                 trace_path::<FULL, F, MIXED>(ctx, lut, ro, dir, start, cone, &mut r)
             };

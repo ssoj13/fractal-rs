@@ -7,7 +7,8 @@
 
 use super::*;
 use standard_surface_bsdf::microfacet::mx_average_alpha;
-use standard_surface_bsdf::surface::{coat_alpha, main_alpha};
+use standard_surface_bsdf::surface::{coat_alpha, main_alpha, transmission_alpha};
+use standard_surface_bsdf::transmission::refract;
 use standard_surface_bsdf::{Environment, dominant_dir, eval_environment, eval_light_disc};
 
 // Deterministic Direct: evaluated Standard Surface, analytic sky, soft shadow and five-probe AO.
@@ -56,10 +57,18 @@ fn direct_shadow<const F: u32>(ctx: Context<'_>, p: V3, n: V3, l: V3, eps: f32, 
     let mut t = 4.0 * eps;
     let origin = add(p, mul(n, t));
     let cap = 2.0 * max_distance / steps as f32;
+    let limit = if ctx.world {
+        match march_span(ctx, origin, l) {
+            Some((_, t_exit)) => t_exit,
+            None => return 1.0,
+        }
+    } else {
+        max_distance
+    };
     let sharpness = if angle > 0.0 { 1.0 / angle.tan() } else { 0.0 };
     let mut visibility = 1.0f32;
     let mut i = 0;
-    while i < steps && t <= max_distance {
+    while i < steps && t <= limit {
         let d = march_sample::<F>(ctx, add(origin, mul(l, t)), 0).0;
         if d < eps {
             return (1.0 - strength).max(0.0);
@@ -93,13 +102,15 @@ fn direct_ao<const F: u32>(ctx: Context<'_>, p: V3, n: V3) -> f32 {
         add(mul(n, 0.6), mul(bitangent, 0.8)),
         add(mul(n, 0.6), mul(bitangent, -0.8)),
     ];
+    let radius = global(P_AO_RADIUS);
+    let inv_steps = radius / steps as f32;
     let mut sum = 0.0;
     let mut j = 0;
     while j < 5 {
         let component = if j == 0 { 1.0 } else { 0.6 };
         let mut i = 1;
         while i <= steps {
-            let t = global(P_AO_RADIUS) * i as f32 / steps as f32;
+            let t = i as f32 * inv_steps;
             let clearance = t * component;
             let d = march_sample::<F>(ctx, add(p, mul(directions[j], t)), 0).0;
             sum += ((clearance - d) / clearance).clamp(0.0, 1.0);
@@ -108,6 +119,13 @@ fn direct_ao<const F: u32>(ctx: Context<'_>, p: V3, n: V3) -> f32 {
         j += 1;
     }
     (1.0 - strength * sum / (steps * 5) as f32).max(0.0)
+}
+/// Specular occlusion from diffuse ambient occlusion, view angle, and roughness (Lagarde & de
+/// Rousiers 2014): prevents diffuse AO from darkening smooth grazing Fresnel reflections while
+/// still occluding rough specular in deep cavities.
+#[inline(always)]
+fn direct_specular_ao(nv: f32, ao: f32, roughness: f32) -> f32 {
+    ((nv + ao).powf((-16.0 * roughness - 1.0).exp2()) - 1.0 + ao).clamp(0.0, 1.0)
 }
 /// The key light of Direct at `p`: one disc light's shading times its soft shadow. A single
 /// object (OFX) has the root light with its `P_LIGHT_HALF_ANGLE`; a world sums its directional
@@ -124,31 +142,40 @@ fn direct_key<const F: u32>(
     eps: f32,
 ) -> V3 {
     if !ctx.world {
+        let intensity = global(P_LIGHT_INTENSITY);
+        if intensity <= 0.0 {
+            return [0.0; 3];
+        }
         let l = pv3(ctx, P_LIGHT_DIR);
         let angle = global(P_LIGHT_HALF_ANGLE);
         let sun = eval_light_disc(inputs, frame, view, l, angle).sum();
+        if max3(sun) <= 0.0 {
+            return [0.0; 3];
+        }
         let visibility = direct_shadow::<F>(ctx, p, n, l, eps, angle);
-        return mul(
-            had(pv3(ctx, P_LIGHT_COLOR), sun),
-            global(P_LIGHT_INTENSITY) * visibility,
-        );
+        return mul(had(pv3(ctx, P_LIGHT_COLOR), sun), intensity * visibility);
     }
     let mut key = [0.0; 3];
     let mut i = 0usize;
     while i < global(P_LIGHT_COUNT) as usize {
-        let l = light_v3(ctx, i, P_LIGHT_DIR);
-        let angle = (1.0 - light_slot(ctx, i, P_SUN_ONE_MINUS_COS))
-            .clamp(-1.0, 1.0)
-            .acos();
-        let sun = eval_light_disc(inputs, frame, view, l, angle).sum();
-        let visibility = direct_shadow::<F>(ctx, p, n, l, eps, angle);
-        key = add(
-            key,
-            mul(
-                had(light_v3(ctx, i, P_LIGHT_COLOR), sun),
-                light_slot(ctx, i, P_LIGHT_INTENSITY) * visibility,
-            ),
-        );
+        let intensity = light_slot(ctx, i, P_LIGHT_INTENSITY);
+        if intensity > 0.0 {
+            let l = light_v3(ctx, i, P_LIGHT_DIR);
+            let angle = (1.0 - light_slot(ctx, i, P_SUN_ONE_MINUS_COS))
+                .clamp(-1.0, 1.0)
+                .acos();
+            let sun = eval_light_disc(inputs, frame, view, l, angle).sum();
+            if max3(sun) > 0.0 {
+                let visibility = direct_shadow::<F>(ctx, p, n, l, eps, angle);
+                key = add(
+                    key,
+                    mul(
+                        had(light_v3(ctx, i, P_LIGHT_COLOR), sun),
+                        intensity * visibility,
+                    ),
+                );
+            }
+        }
         i += 1;
     }
     key
@@ -167,8 +194,17 @@ pub(super) fn trace_direct<const F: u32>(
     lut: &[[f32; 4]],
     origin: V3,
     dir: V3,
+    start: f32,
 ) -> PathSample {
-    let m = march::<F>(ctx, origin, dir, RAY_DIRECT, 0.0, global(P_FOOTPRINT), 0.0);
+    let m = march::<F>(
+        ctx,
+        origin,
+        dir,
+        RAY_DIRECT,
+        0.0,
+        global(P_FOOTPRINT),
+        start,
+    );
     let unresolved = m.outcome == Outcome::Unresolved;
     // Keinert et al. 2014 (Enhanced Sphere Tracing, 3.2): one ray per pixel, so an unresolved
     // ray's closest sample stands in for the surface when its screen-space error is under half
@@ -236,17 +272,41 @@ pub(super) fn trace_direct<const F: u32>(
     inputs.specular_roughness = direct_roughness(inputs.specular_roughness, variance);
     inputs.coat_roughness = direct_roughness(inputs.coat_roughness, variance);
     let ao = direct_ao::<F>(ctx, m.point, n);
+    let (spec_ao, coat_ao) = if ctx.world {
+        let nv = dot(facing, view).max(0.0);
+        (
+            direct_specular_ao(nv, ao, inputs.specular_roughness),
+            direct_specular_ao(nv, ao, inputs.coat_roughness),
+        )
+    } else {
+        (ao, ao)
+    };
     let specular_alpha = mx_average_alpha(main_alpha(&inputs));
     let coat_lobe_alpha = mx_average_alpha(coat_alpha(&inputs));
     let specular_dir = dominant_dir(&frame, view, specular_alpha);
     let coat_dir = dominant_dir(&frame, view, coat_lobe_alpha);
+    let transmission_radiance = if ctx.world && inputs.transmission > 0.0 {
+        let trans_alpha = mx_average_alpha(transmission_alpha(&inputs));
+        let refracted = refract(view, facing, inputs.specular_ior);
+        let trans_dir = if dot(refracted, refracted) > 0.0 {
+            refracted
+        } else {
+            specular_dir
+        };
+        mul(sky_specular(ctx, lut, trans_dir, trans_alpha), spec_ao)
+    } else {
+        [0.0; 3]
+    };
     // The sky light of Direct (OFX's CPU and WGSL `fractal3d::shade`): the HDRI's harmonics and
     // its mip level matched to each lobe's width, or the gradient's exact convolution.
     let environment = Environment {
         irradiance: mul(sky_irradiance(ctx, lut, facing), ao),
-        specular_radiance: mul(sky_specular(ctx, lut, specular_dir, specular_alpha), ao),
-        coat_radiance: mul(sky_specular(ctx, lut, coat_dir, coat_lobe_alpha), ao),
-        transmission_radiance: [0.0; 3],
+        specular_radiance: mul(
+            sky_specular(ctx, lut, specular_dir, specular_alpha),
+            spec_ao,
+        ),
+        coat_radiance: mul(sky_specular(ctx, lut, coat_dir, coat_lobe_alpha), coat_ao),
+        transmission_radiance,
     };
     let reflected = eval_environment(&inputs, &frame, view, &environment).sum();
     let emitted = eval_emission(&inputs, &frame, view);
