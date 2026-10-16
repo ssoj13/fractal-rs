@@ -128,7 +128,8 @@ pub const FAMILY_WORLD: u32 = 8;
 /// Each object starts with the existing parameter layout, then a row-major inverse affine.
 /// Version 4: scene masks per object (`O_MASK_COUNT`, `O_MASKS`). Version 5: the parameter
 /// layout gained the orbit offset and the inversion slots, so every object row is longer.
-pub const WORLD_ABI_VERSION: u32 = 5;
+/// Version 6: each mask row carries an array (linear or radial copies, a union).
+pub const WORLD_ABI_VERSION: u32 = 6;
 pub const O_INVERSE: usize = P_COUNT;
 pub const O_DISTANCE_SCALE: usize = O_INVERSE + 12;
 pub const O_CLIP_RADIUS: usize = O_DISTANCE_SCALE + 1;
@@ -139,12 +140,15 @@ pub const O_MASKS: usize = O_MASK_COUNT + 1;
 pub const OBJECT_STRIDE: usize = O_MASKS + MAX_MASKS * MASK_STRIDE;
 
 /// Masks per world object: a scene mask node (sphere, box or cell grid) intersects the estimate of
-/// the objects in its scope, `d = max(d, mask)`, the mask negated when inverted.
+/// the objects in its scope, `d = max(d, mask)`, the mask negated when inverted. An array on a
+/// sphere or box is a union of copies inside that one row, then inverted as a whole.
 pub const MAX_MASKS: usize = 4;
 /// A mask row: row-major world-to-mask inverse affine (12), the distance scale (a lower bound of
 /// that inverse's stretch, so mask-space distances stay conservative in world space), shape,
 /// invert (0 / 1), size (sphere radius in x; box half extents; cell edge in x), cell density
-/// (removed share, 0..1) and seed.
+/// (removed share, 0..1) and seed, then the array: mode (0 off, [`ARRAY_LINEAR`], [`ARRAY_RADIAL`]),
+/// copy count, linear step, ring radius, axis (0 X, 1 Y, 2 Z), sweep in radians (0 = full circle)
+/// and align (0 / 1, radial boxes turn to face outward).
 pub const M_INVERSE: usize = 0;
 pub const M_SCALE: usize = 12;
 pub const M_SHAPE: usize = 13;
@@ -152,10 +156,21 @@ pub const M_INVERT: usize = 14;
 pub const M_SIZE: usize = 15;
 pub const M_DENSITY: usize = 18;
 pub const M_SEED: usize = 19;
-pub const MASK_STRIDE: usize = 20;
+pub const M_ARRAY: usize = 20;
+pub const M_ARRAY_COUNT: usize = 21;
+pub const M_ARRAY_OFFSET: usize = 22;
+pub const M_ARRAY_RADIUS: usize = 25;
+pub const M_ARRAY_AXIS: usize = 26;
+pub const M_ARRAY_SWEEP: usize = 27;
+pub const M_ARRAY_ALIGN: usize = 28;
+pub const MASK_STRIDE: usize = 29;
 pub const MASK_SPHERE: u32 = 0;
 pub const MASK_BOX: u32 = 1;
 pub const MASK_CELLS: u32 = 2;
+pub const ARRAY_LINEAR: u32 = 1;
+pub const ARRAY_RADIAL: u32 = 2;
+/// Most copies one mask row evaluates. The host clamps to this.
+pub const ARRAY_MAX: u32 = 32;
 pub const LIGHT_STRIDE: usize = P_SKY_INTENSITY - P_LIGHT_DIR;
 
 /// Palette LUT entries (ofx-gen PALETTE_SAMPLES) plus the interior colour.

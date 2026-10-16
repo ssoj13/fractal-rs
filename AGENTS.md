@@ -12,7 +12,7 @@ map: `C:\projects\projects.rust.cg\nv\prs\kernels-divergence.md`).
 
 | crate | content | consumers |
 |---|---|---|
-| `fractal-core` | `params` (parameter ABI), `luma`, `path_sampling`, `transmission` (the Owen-Sobol sampler is render-rs `standard_surface_bsdf::sampling::sobol`, shared with pt-integrator's CPU/WGSL twins) | kernels (device), WarpBro host, OFX host |
+| `fractal-core` | `params` (parameter ABI), `inversion`, `mask_array`, `luma`, `path_sampling`, `transmission` (the Owen-Sobol sampler is render-rs `standard_surface_bsdf::sampling::sobol`, shared with pt-integrator's CPU/WGSL twins) | kernels (device), WarpBro host, OFX host |
 | `fractal-kernels` | `#[cuda_module] kernels` (cuda-host flavour: typed loader `kernels::load`), `direct` feature | WarpBro links it; OFX regenerates embedded PTX/cubin from it |
 | `fractal-materials` | material presets (append-only: hosts store indices) | WarpBro `materials.rs`, OFX `materials.rs` |
 
@@ -25,6 +25,15 @@ estimates changed every Mandelbulb render by ULPs; the inversion as an out-of-li
 (`inverted_estimate`, one check atop `signed_distance_and_trap`) keeps 34 of 36 WarpBro gallery
 routes bit-identical, world Hybrid within ULPs (normals 2.6e-4). Not a regression; never chase
 layout tricks for bits.
+
+## Mask arrays (ABI 6, 2026-10-15)
+
+`WORLD_ABI_VERSION` 6: the mask row gains `M_ARRAY` (0 off, `ARRAY_LINEAR`, `ARRAY_RADIAL`),
+`M_ARRAY_COUNT` (clamped to `ARRAY_MAX` 32), `M_ARRAY_OFFSET`, `M_ARRAY_RADIUS`, `M_ARRAY_AXIS`,
+`M_ARRAY_SWEEP` (radians, 0 = full circle), `M_ARRAY_ALIGN`; `MASK_STRIDE` 29. Sphere and box
+masks union their copies (`array_union`, out of line); Cells ignores the array. Copy placement is
+`fractal_core::mask_array` only: the kernel's `array_copy_distance` and WarpBro's
+`Mask::copy_frames` (overlay wires) both call it. ofx-rs does not pack masks.
 
 ## Build facts (verified)
 

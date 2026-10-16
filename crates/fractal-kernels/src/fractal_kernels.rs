@@ -31,6 +31,7 @@ use fractal_core::params::*;
 )]
 pub mod kernels {
     use super::*;
+    use fractal_core::mask_array;
     use fractal_core::path_sampling::{
         allows_surface_vertex, fast_ggx_pdf, fast_ggx_sample_local, fast_spec_probability,
     };
@@ -861,6 +862,64 @@ pub mod kernels {
         ((h >> 8) as f32 * (1.0 / 16_777_216.0)) < density
     }
 
+    /// Signed distance of one sphere or box at the local origin.
+    #[inline(always)]
+    fn shape_distance(shape: u32, p: V3, s: V3) -> f32 {
+        if shape == MASK_SPHERE {
+            length(p) - s[0]
+        } else {
+            let q = [p[0].abs() - s[0], p[1].abs() - s[1], p[2].abs() - s[2]];
+            length([q[0].max(0.0), q[1].max(0.0), q[2].max(0.0)]) + max3(q).min(0.0)
+        }
+    }
+
+    /// Distance to copy `index` of a linear or radial array (`fractal_core::mask_array`, the
+    /// placement the hosts draw). Copies are a union: the caller keeps the minimum. Align turns
+    /// a box into the copy's ring basis; a sphere ignores it.
+    #[inline(never)]
+    fn array_copy_distance(m: &[f32], p: V3, s: V3, shape: u32, index: u32, count: u32) -> f32 {
+        if m[M_ARRAY] != ARRAY_RADIAL as f32 {
+            let i = index as f32;
+            return shape_distance(
+                shape,
+                sub(
+                    p,
+                    [
+                        m[M_ARRAY_OFFSET] * i,
+                        m[M_ARRAY_OFFSET + 1] * i,
+                        m[M_ARRAY_OFFSET + 2] * i,
+                    ],
+                ),
+                s,
+            );
+        }
+        let (sn, cs) = sin_cos(mask_array::angle(index, count, m[M_ARRAY_SWEEP]));
+        let axis = m[M_ARRAY_AXIS] as u32;
+        let d = sub(p, mask_array::ring_point(axis, m[M_ARRAY_RADIUS], sn, cs));
+        if m[M_ARRAY_ALIGN] == 0.0 || shape != MASK_BOX {
+            return shape_distance(shape, d, s);
+        }
+        let [out, up, tan] = mask_array::ring_basis(axis, sn, cs);
+        shape_distance(shape, [dot(d, out), dot(d, up), dot(d, tan)], s)
+    }
+
+    /// Union of the array copies. Out of line so the cell-grid distance stays the size it was.
+    #[inline(never)]
+    fn array_union(m: &[f32], p: V3, s: V3) -> f32 {
+        let shape = m[M_SHAPE] as u32;
+        let count = mask_array::count(m[M_ARRAY_COUNT] as u32);
+        let mut best = array_copy_distance(m, p, s, shape, 0, count);
+        let mut i = 1;
+        while i < count {
+            let d = array_copy_distance(m, p, s, shape, i, count);
+            if d < best {
+                best = d;
+            }
+            i += 1;
+        }
+        best
+    }
+
     /// A scene mask's distance at world point `x` (a lower bound in world units, positive where
     /// the mask removes): the shape's signed distance in mask space, scaled conservatively, and
     /// negated when inverted. Cells: the edge `size.x` grid, a cell removed when its hash falls
@@ -930,6 +989,11 @@ pub mod kernels {
                 }
                 if removed { edge * best } else { -edge * best }
             }
+        };
+        let local = if m[M_SHAPE] as u32 != MASK_CELLS && m[M_ARRAY] != 0.0 {
+            array_union(m, p, s)
+        } else {
+            local
         };
         let d = local * m[M_SCALE];
         if m[M_INVERT] != 0.0 { -d } else { d }
